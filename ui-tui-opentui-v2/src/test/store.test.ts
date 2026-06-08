@@ -153,3 +153,18 @@ describe('session store — blocking prompts (Phase 3)', () => {
     expect(store.state.prompt).toMatchObject({ kind: 'secret', envVar: 'API_KEY', requestId: 's2' })
   })
 })
+
+describe('session store — resume hydrate (Phase 4b)', () => {
+  test('beginBuffer + commitSnapshot replaces history then replays events buffered across the resume', () => {
+    const store = createSessionStore()
+    store.beginBuffer()
+    // a live event arrives DURING the (async) session.resume RPC
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'live during resume' } })
+    // the snapshot commits afterwards
+    store.commitSnapshot([{ role: 'user', text: 'old question' }])
+    expect(store.state.messages).toHaveLength(2) // snapshot(1) + the replayed assistant turn(1)
+    expect(store.state.messages[0]).toMatchObject({ role: 'user', text: 'old question' })
+    expect(store.state.messages[1]!.parts?.[0]).toMatchObject({ type: 'text', text: 'live during resume' })
+  })
+})

@@ -306,18 +306,26 @@ export function createSessionStore() {
     setState('prompt', undefined)
   }
 
-  /**
-   * Begin a resume hydrate: buffer live events, replace history with the
-   * snapshot, then replay buffered events. `loadSnapshot` maps the gateway's
-   * historical messages into the store's Message[] (Phase 4 fills the mapping).
-   */
-  function hydrate(loadSnapshot: () => Message[]): void {
-    buffering = []
-    const snapshot = loadSnapshot()
+  // ── resume hydrate (opencode sync-v2): buffer live events while the snapshot
+  // loads, then replace history + replay the buffer in order. Split into begin/
+  // commit so the buffer can span an async `session.resume` RPC.
+  /** Start buffering live events (call BEFORE the async resume RPC). Idempotent. */
+  function beginBuffer(): void {
+    if (!buffering) buffering = []
+  }
+
+  /** Replace history with the resume snapshot, then replay events buffered meanwhile. */
+  function commitSnapshot(snapshot: Message[]): void {
     setState('messages', snapshot)
-    const pending = buffering
+    const pending = buffering ?? []
     buffering = null
     for (const event of pending) applyNow(event)
+  }
+
+  /** Synchronous convenience: buffer → load → commit (used by tests). */
+  function hydrate(loadSnapshot: () => Message[]): void {
+    beginBuffer()
+    commitSnapshot(loadSnapshot())
   }
 
   return {
@@ -328,6 +336,8 @@ export function createSessionStore() {
     clearTranscript,
     setConfirm,
     hydrate,
+    beginBuffer,
+    commitSnapshot,
     duplicate,
     clearPrompt
   } as const

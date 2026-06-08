@@ -27,6 +27,7 @@ import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
 import { getLog } from '../boundary/log.ts'
 import { acquireRenderer } from '../boundary/renderer.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
+import { mapResumeHistory } from '../logic/resume.ts'
 import { dispatchSlash, type SlashContext } from '../logic/slash.ts'
 import { createSessionStore, type SessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
@@ -42,6 +43,8 @@ export interface TuiInput {
   readonly cols: number
   /** Optional initial prompt submitted once the session is ready — the Phase-1 stand-in for the composer. */
   readonly initialPrompt?: string
+  /** Resume a session instead of creating one: a session id, or 'recent'/'last' (→ session.most_recent). */
+  readonly resumeId?: string
 }
 
 const READY_POLL = Duration.millis(100)
@@ -49,10 +52,11 @@ const READY_TIMEOUT_MS = 20_000
 
 /**
  * Live session bootstrap: wait for the unsolicited `gateway.ready` handshake,
- * `session.create`, then (if given) submit the initial prompt. Forked into the
- * entry scope so it runs concurrently with the render + the quit-await. Any
- * failure is logged (file/ring sink) and swallowed — a bootstrap hiccup must
- * never tear down the rendered UI.
+ * then either RESUME a session (hydrate its transcript — incl. tool rows — via
+ * the snapshot, buffering live events across the RPC) or CREATE a fresh one, and
+ * (if given) submit the initial prompt. Forked into the entry scope so it runs
+ * concurrently with the render + the quit-await. Any failure is logged and
+ * swallowed — a bootstrap hiccup must never tear down the rendered UI.
  */
 const bootstrapSession = (gateway: GatewayServiceShape, store: SessionStore, input: TuiInput) =>
   Effect.gen(function* () {
@@ -66,13 +70,45 @@ const bootstrapSession = (gateway: GatewayServiceShape, store: SessionStore, inp
       log.warn('bootstrap', 'no gateway.ready within timeout', { waited })
       return
     }
-    const created = yield* gateway.request<{ session_id?: string }>('session.create', { cols: input.cols })
-    const sid = created?.session_id ?? gateway.sessionId()
-    if (!sid) {
-      log.warn('bootstrap', 'session.create returned no session_id')
-      return
+
+    let sid: string | undefined
+    if (input.resumeId) {
+      sid = input.resumeId
+      if (sid === 'recent' || sid === 'last') {
+        const recent = yield* gateway.request<{ session_id?: string }>('session.most_recent', {})
+        sid = recent?.session_id
+      }
+      if (!sid) {
+        log.warn('bootstrap', 'no session to resume', { resumeId: input.resumeId })
+        return
+      }
+      // Buffer live events across the resume RPC, then replace history + replay.
+      store.beginBuffer()
+      const t0 = Date.now()
+      const resumed = yield* gateway.request<{ messages?: unknown }>('session.resume', {
+        cols: input.cols,
+        session_id: sid
+      })
+      const t1 = Date.now()
+      const snapshot = mapResumeHistory(resumed?.messages)
+      store.commitSnapshot(snapshot)
+      // Hydration profile: rpc_ms = server load + transport; hydrate_ms = map + store write.
+      log.info('bootstrap', 'session resumed', {
+        count: snapshot.length,
+        hydrate_ms: Date.now() - t1,
+        rpc_ms: t1 - t0,
+        sid
+      })
+    } else {
+      const created = yield* gateway.request<{ session_id?: string }>('session.create', { cols: input.cols })
+      sid = created?.session_id ?? gateway.sessionId()
+      if (!sid) {
+        log.warn('bootstrap', 'session.create returned no session_id')
+        return
+      }
+      log.info('bootstrap', 'session created', { sid })
     }
-    log.info('bootstrap', 'session created', { sid })
+
     const prompt = input.initialPrompt?.trim()
     if (prompt) {
       store.pushUser(prompt)
@@ -191,8 +227,10 @@ if (import.meta.main) {
   const fake = TRUE_RE.test(process.env.HERMES_TUI_FAKE?.trim() ?? '')
   const cols = process.stdout.columns || 80
   const initialPrompt = process.env.HERMES_TUI_PROMPT?.trim() || process.argv.slice(2).join(' ').trim()
+  const resumeId = process.env.HERMES_TUI_RESUME?.trim()
   const base = { mouse: false, fake, cols }
-  const input: TuiInput = initialPrompt ? { ...base, initialPrompt } : base
+  const withPrompt = initialPrompt ? { ...base, initialPrompt } : base
+  const input: TuiInput = resumeId ? { ...withPrompt, resumeId } : withPrompt
 
   const onFatal = (error: unknown) => {
     getLog().error('entry', 'fatal', { error: String(error) })
