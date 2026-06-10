@@ -80,7 +80,7 @@ export function TerminalTab({ cwd, onAddSelectionToChat }: TerminalTabProps) {
               variant="secondary"
             >
               {t.rightSidebar.addToChat}
-              <span className="ml-1 text-[0.6rem] text-(--ui-text-tertiary)">{addSelectionShortcutLabel()}</span>
+              <span className="ml-1 text-[0.6rem] text-(--ui-text-tertiary)">{addSelectionShortcutLabel}</span>
             </Button>
           </div>
         )}

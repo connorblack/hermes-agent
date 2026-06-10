@@ -6,6 +6,7 @@ import {
   keybindAction,
   type KeybindBindings
 } from '@/lib/keybinds/actions'
+import type { Combo } from '@/lib/keybinds/combo'
 import { arraysEqual, persistString, storedString } from '@/lib/storage'
 
 const STORAGE_KEY = 'hermes.desktop.keybinds'
@@ -27,7 +28,7 @@ function loadBindings(): KeybindBindings {
       const value = parsed[id]
 
       if (Array.isArray(value)) {
-        base[id] = value.filter((combo): combo is string => typeof combo === 'string')
+        base[id] = value.filter((combo): combo is string => typeof combo === 'string') as Combo[]
       }
     }
   } catch {
@@ -74,7 +75,7 @@ export const $comboIndex = computed($bindings, bindings => {
   return index
 })
 
-export function setBinding(actionId: string, combos: string[]): void {
+export function setBinding(actionId: string, combos: Combo[]): void {
   if (!keybindAction(actionId)) {
     return
   }
@@ -97,7 +98,7 @@ export function resetAllBindings(): void {
 }
 
 // Other actions that already use `combo` (excluding `actionId` itself).
-export function conflictsFor(actionId: string, combo: string): string[] {
+export function conflictsFor(actionId: string, combo: Combo): string[] {
   const bindings = $bindings.get()
 
   return KEYBIND_ACTION_IDS.filter(id => id !== actionId && (bindings[id] ?? []).includes(combo))

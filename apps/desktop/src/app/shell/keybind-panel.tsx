@@ -14,7 +14,7 @@ import {
   type KeybindActionMeta,
   type KeybindReadonly
 } from '@/lib/keybinds/actions'
-import { formatCombo } from '@/lib/keybinds/combo'
+import { formatCombo, formatFakeCombo } from '@/lib/keybinds/combo'
 import { arraysEqual } from '@/lib/storage'
 import {
   $bindings,
@@ -210,7 +210,7 @@ function ReadonlyRow({ shortcut }: { shortcut: KeybindReadonly }) {
       <div className="flex shrink-0 items-center gap-1">
         {shortcut.keys.map(key => (
           <span className="kbd-cap" key={key}>
-            {formatCombo(key)}
+            {formatFakeCombo(key)}
           </span>
         ))}
       </div>

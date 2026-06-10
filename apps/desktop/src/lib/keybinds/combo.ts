@@ -5,12 +5,14 @@
 // both. We derive the base key from `event.code` (not `event.key`) so Shift never
 // mutates it ("shift+/" stays "shift+/" instead of becoming "shift+?").
 
-export const IS_MAC =
+const IS_MAC =
   typeof navigator !== 'undefined' && /mac/i.test(navigator.platform || navigator.userAgent || '')
+
+export const modKey = IS_MAC ? 'metaKey' as const : 'ctrlKey' as const
 
 // event.code → canonical base token. Letters/digits map to their lowercase
 // character; everything else uses an explicit name so combos read cleanly.
-const CODE_TO_KEY: Record<string, string> = {
+const CODE_TO_KEY = {
   Backquote: '`',
   Backslash: '\\',
   BracketLeft: '[',
@@ -31,7 +33,49 @@ const CODE_TO_KEY: Record<string, string> = {
   ArrowDown: 'down',
   ArrowLeft: 'left',
   ArrowRight: 'right'
+} as const satisfies Record<Capitalize<string>, Lowercase<string>>
+
+type SpecialKey = typeof CODE_TO_KEY[keyof typeof CODE_TO_KEY]
+
+type Alpha = 'a'|'b'|'c'|'d'|'e'|'f'|'g'|'h'|'i'|'j'|'k'|'l'|'m'
+           | 'n'|'o'|'p'|'q'|'r'|'s'|'t'|'u'|'v'|'w'|'x'|'y'|'z'
+
+export type Digit = '0'|'1'|'2'|'3'|'4'|'5'|'6'|'7'|'8'|'9'
+
+
+type FKey =
+| 'f1' | 'f2' | 'f3' | 'f4' | 'f5' | 'f6'
+| 'f7' | 'f8' | 'f9' | 'f10' | 'f11' | 'f12'
+| 'f13' | 'f14' | 'f15' | 'f16' | 'f17' | 'f18'
+| 'f19' | 'f20' | 'f21' | 'f22' | 'f23' | 'f24'
+
+type BaseKey = Alpha | Digit | FKey | SpecialKey
+
+// subset of https://developer.mozilla.org/en-US/docs/Web/API/UI_Events/Keyboard_event_code_values
+type KeyCode = Uppercase<FKey> | `Digit${Digit}` | `Key${Uppercase<Alpha>}` | keyof typeof CODE_TO_KEY
+
+function baseKeyFromCode(code: KeyCode): BaseKey | null {
+  if (code.startsWith('Key')) {
+    return code.slice(3).toLowerCase() as Alpha
+  }
+
+  if (code.startsWith('Digit')) {
+    return code.slice(5) as Digit
+  }
+
+  if (code.startsWith('Numpad')) {
+    const rest = code.slice(6)
+
+    return /^[0-9]$/.test(rest) ? rest as Digit : null
+  }
+
+  if (code.startsWith('F') && /^F\d{1,2}$/.test(code)) {
+    return code.toLowerCase() as FKey
+  }
+
+  return CODE_TO_KEY[code as keyof typeof CODE_TO_KEY] ?? null
 }
+
 
 const MODIFIER_CODES = new Set([
   'AltLeft',
@@ -44,42 +88,20 @@ const MODIFIER_CODES = new Set([
   'ShiftRight'
 ])
 
-function baseKeyFromCode(code: string): string | null {
-  if (code.startsWith('Key')) {
-    return code.slice(3).toLowerCase()
-  }
-
-  if (code.startsWith('Digit')) {
-    return code.slice(5)
-  }
-
-  if (code.startsWith('Numpad')) {
-    const rest = code.slice(6)
-
-    return /^[0-9]$/.test(rest) ? rest : null
-  }
-
-  if (code.startsWith('F') && /^F\d{1,2}$/.test(code)) {
-    return code.toLowerCase()
-  }
-
-  return CODE_TO_KEY[code] ?? null
-}
-
 // Returns the canonical combo for a keydown, or null while only modifiers are
 // held (so capture mode keeps waiting for a real key).
-export function comboFromEvent(event: KeyboardEvent): string | null {
+export function comboFromEvent(event: KeyboardEvent): Combo | null {
   if (MODIFIER_CODES.has(event.code)) {
     return null
   }
 
-  const base = baseKeyFromCode(event.code)
+  const base = baseKeyFromCode(event.code as KeyCode)
 
   if (!base) {
     return null
   }
 
-  const parts: string[] = []
+  const parts: Combo[] = []
 
   if (event.metaKey || event.ctrlKey) {
     parts.push('mod')
@@ -95,10 +117,16 @@ export function comboFromEvent(event: KeyboardEvent): string | null {
 
   parts.push(base)
 
-  return parts.join('+')
+  return parts.join('+') as Combo
 }
 
-const TOKEN_LABELS: Record<string, string> = {
+const MOD_LABELS = {
+  mod: IS_MAC ? '⌘' : 'Ctrl',
+  alt: IS_MAC ? '⌥' : 'Alt',
+  shift: IS_MAC ? '⇧' : 'Shift'
+} as const
+
+const FANCY_KEY_LABELS = {
   enter: '↵',
   escape: 'Esc',
   backspace: '⌫',
@@ -107,10 +135,15 @@ const TOKEN_LABELS: Record<string, string> = {
   up: '↑',
   down: '↓',
   left: '←',
-  right: '→'
+  right: '→',
+} as const
+
+const TOKEN_LABELS: Record<string, string> = {
+  ...MOD_LABELS,
+  ...FANCY_KEY_LABELS
 }
 
-function labelForBase(base: string): string {
+function labelForToken(base: string): string {
   if (TOKEN_LABELS[base]) {
     return TOKEN_LABELS[base]
   }
@@ -122,31 +155,36 @@ function labelForBase(base: string): string {
   return base.length === 1 ? base.toUpperCase() : base
 }
 
-// Human-readable label, e.g. "⌘⇧K" on macOS, "Ctrl+Shift+K" elsewhere.
-export function formatCombo(combo: string): string {
+// 
+
+type ModKey = keyof typeof MOD_LABELS
+
+type ModPrefix = `${'mod+'|''}${'alt+'|''}${'shift+'|''}` 
+
+type ModPrefixedCombo<Suffix extends string> = 
+  | `${ModPrefix}${Suffix}` 
+  | ModKey
+  | 'mod+alt' | 'mod+shift' | 'alt+shift' | 'mod+alt+shift'
+
+export type Combo = ModPrefixedCombo<BaseKey>
+export type FakeCombo = ModPrefixedCombo<BaseKey | '@' | '?'>
+
+// Human-readable keys, e.g. "mod+shift+k" returns ["⌘","⇧","K"] on macos,["Ctrl","Shift","K"] elsewhere.
+export function normalizeCombo(combo: Combo): string[] {
   const parts = combo.split('+')
-  const base = parts.pop() ?? ''
-  const mods = parts
 
-  const modLabels = mods.map(mod => {
-    if (mod === 'mod') {
-      return IS_MAC ? '⌘' : 'Ctrl'
-    }
+  return parts.map(p => labelForToken(p.trim()))
+}
 
-    if (mod === 'alt') {
-      return IS_MAC ? '⌥' : 'Alt'
-    }
+// Human-readable label, e.g. "mod+shift+k" returns "⌘⇧K" on macOS, "Ctrl+Shift+K" elsewhere.
+export function formatCombo(combo: Combo): string {
+  return normalizeCombo(combo).join(IS_MAC ? '' : '+') 
+}
 
-    if (mod === 'shift') {
-      return IS_MAC ? '⇧' : 'Shift'
-    }
 
-    return mod
-  })
-
-  const tokens = [...modLabels, labelForBase(base)]
-
-  return IS_MAC ? tokens.join('') : tokens.join('+')
+// like `formatCombo` but allows any input like `@`
+export function formatFakeCombo(combo: FakeCombo): string {
+  return normalizeCombo(combo as Combo).join(IS_MAC ? '' : '+') 
 }
 
 // True when focus is in a text-entry surface, so bare-key shortcuts don't fire
@@ -164,6 +202,6 @@ export function isEditableTarget(target: EventTarget | null): boolean {
 
 // Combos with a primary modifier (Cmd/Ctrl) are safe to fire even while typing
 // (e.g. ⌘K from the composer); bare/Shift-only combos are suppressed in inputs.
-export function comboAllowedInInput(combo: string): boolean {
-  return combo.startsWith('mod+') || combo === 'mod'
+export function comboAllowedInInput(combo: Combo): boolean {
+  return combo.startsWith('mod')
 }

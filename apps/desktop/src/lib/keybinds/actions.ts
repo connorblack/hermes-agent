@@ -5,6 +5,9 @@
 // like navigate / theme); labels come from i18n (`t.keybinds.actions[id]`). To
 // add a hotkey, add a row here and a handler there — nothing else.
 
+import type { Combo, FakeCombo } from "./combo";
+
+
 export type KeybindCategory = 'composer' | 'profiles' | 'session' | 'navigation' | 'view'
 
 // The self-referential opener — bound + dispatched like any action, but shown in
@@ -25,7 +28,7 @@ export interface KeybindActionMeta {
   id: string
   category: KeybindCategory
   /** Default combos. Empty = shipped unbound (user can assign one). */
-  defaults: readonly string[]
+  defaults: Combo[]
 }
 
 // Positional switch slots for *named* profiles: ⌘1…⌘9 for profiles 1-9, then
@@ -33,15 +36,16 @@ export interface KeybindActionMeta {
 // `profile.default`) — ⌘` is macOS-reserved (window cycling) and ⌘0 is reset-zoom.
 export const PROFILE_SLOT_COUNT = 18
 
-function comboForSlot(slot: number): string {
-  return slot <= 9 ? `mod+${slot}` : `mod+alt+${slot - 9}`
-}
+const PROFILE_SWITCH_ACTIONS: KeybindActionMeta[] = Array.from({ length: PROFILE_SLOT_COUNT }, (_, i) => {
+  const slot = i+1
+  const combo = (slot <= 9 ? `mod+${slot}` : `mod+alt+${slot - 9}`) as Combo
 
-const PROFILE_SWITCH_ACTIONS: KeybindActionMeta[] = Array.from({ length: PROFILE_SLOT_COUNT }, (_, i) => ({
-  id: `profile.switch.${i + 1}`,
-  category: 'profiles' as const,
-  defaults: [comboForSlot(i + 1)]
-}))
+  return ({
+    id: `profile.switch.${i + 1}`,
+    category: 'profiles' as const,
+    defaults: [combo]
+  })
+})
 
 export const KEYBIND_ACTIONS: readonly KeybindActionMeta[] = [
   // ── Composer ─────────────────────────────────────────────────────────────
@@ -93,7 +97,7 @@ export function keybindAction(id: string): KeybindActionMeta | undefined {
   return ACTION_BY_ID.get(id)
 }
 
-export type KeybindBindings = Record<string, string[]>
+export type KeybindBindings = Record<string, Combo[]>
 
 export function defaultBindings(): KeybindBindings {
   return Object.fromEntries(KEYBIND_ACTIONS.map(action => [action.id, [...action.defaults]]))
@@ -106,7 +110,7 @@ export function defaultBindings(): KeybindBindings {
 export interface KeybindReadonly {
   id: string
   category: KeybindCategory
-  keys: readonly string[]
+  keys: readonly FakeCombo[]
 }
 
 export const KEYBIND_READONLY: readonly KeybindReadonly[] = [

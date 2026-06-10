@@ -1,4 +1,5 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
+import { formatCombo } from '@/lib/keybinds/combo'
 
 import type { Translations } from './types'
 
@@ -694,7 +695,7 @@ export const zh: Translations = {
     sessions: {
       loading: '正在加载已归档会话…',
       archivedTitle: '已归档会话',
-      archivedIntro: '已归档对话会从侧边栏隐藏，但会保留全部消息。在侧边栏 Ctrl/⌘ 点击对话即可归档。',
+      archivedIntro: `已归档对话会从侧边栏隐藏，但会保留全部消息。在侧边栏 ${formatCombo('mod')} 点击对话即可归档。`,
       emptyArchivedTitle: '暂无归档',
       emptyArchivedDesc: '归档一个对话后会显示在这里。',
       unarchive: '取消归档',
@@ -1824,7 +1825,7 @@ export const zh: Translations = {
       loadingQuestion: '正在加载问题…',
       other: '其他 (输入你的答案)',
       placeholder: '输入你的答案…',
-      shortcut: '⌘/Ctrl + Enter 发送',
+      shortcut: `${formatCombo('mod+enter')} 发送`,
       back: '返回',
       skip: '跳过',
       send: '发送'

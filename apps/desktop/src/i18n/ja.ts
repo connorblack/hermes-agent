@@ -1,4 +1,5 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
+import { formatCombo } from '@/lib/keybinds/combo'
 
 import { defineLocale } from './define-locale'
 
@@ -633,7 +634,7 @@ export const ja = defineLocale({
       loading: 'アーカイブ済みセッションを読み込み中…',
       archivedTitle: 'アーカイブ済みセッション',
       archivedIntro:
-        'アーカイブ済みチャットはサイドバーでは非表示になりますが、すべてのメッセージは保持されます。サイドバーのチャットを Ctrl/⌘ クリックするとアーカイブできます。',
+        `アーカイブ済みチャットはサイドバーでは非表示になりますが、すべてのメッセージは保持されます。サイドバーのチャットを ${formatCombo('mod')} クリックするとアーカイブできます。`,
       emptyArchivedTitle: 'アーカイブがありません',
       emptyArchivedDesc: 'チャットをアーカイブするとここに表示されます。',
       unarchive: 'アーカイブを解除',
@@ -1788,7 +1789,7 @@ export const ja = defineLocale({
       loadingQuestion: '質問を読み込み中…',
       other: 'その他（回答を入力）',
       placeholder: '回答を入力…',
-      shortcut: '⌘/Ctrl + Enter で送信',
+      shortcut: `$${formatCombo('mod+enter')} で送信`,
       back: '戻る',
       skip: 'スキップ',
       send: '送信'

@@ -1,4 +1,5 @@
 import { FIELD_DESCRIPTIONS, FIELD_LABELS } from '@/app/settings/constants'
+import { formatCombo } from '@/lib/keybinds/combo'
 
 import type { Translations } from './types'
 
@@ -499,7 +500,7 @@ export const en: Translations = {
       loading: 'Loading archived sessions…',
       archivedTitle: 'Archived sessions',
       archivedIntro:
-        'Archived chats are hidden from the sidebar but keep all their messages. Ctrl/⌘-click a chat in the sidebar to archive it.',
+        `Archived chats are hidden from the sidebar but keep all their messages. ${formatCombo('mod')}-click a chat in the sidebar to archive it.`,
       emptyArchivedTitle: 'Nothing archived',
       emptyArchivedDesc: 'Archive a chat to hide it here.',
       unarchive: 'Unarchive',
@@ -1644,7 +1645,7 @@ export const en: Translations = {
       loadingQuestion: 'Loading question…',
       other: 'Other (type your answer)',
       placeholder: 'Type your answer…',
-      shortcut: '⌘/Ctrl + Enter to send',
+      shortcut: `${formatCombo('mod+enter')} to send`,
       back: 'Back',
       skip: 'Skip',
       send: 'Send'

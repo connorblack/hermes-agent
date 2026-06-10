@@ -1,6 +1,8 @@
 import type { ITheme, Terminal } from '@xterm/xterm'
 import type { CSSProperties } from 'react'
 
+import { formatCombo, modKey } from '@/lib/keybinds/combo'
+
 // Solarized-derived palette, but with bright ANSI 8–15 promoted to real
 // accent variants instead of Schoonover's UI grays. Hermes' TUI skins (gold,
 // crimson, ...) emit bright SGR codes that would otherwise wash out to gray.
@@ -34,12 +36,10 @@ const THEME: ITheme = {
 
 export const terminalTheme = (): ITheme => THEME
 
-export const isMacPlatform = () => navigator.platform.toLowerCase().includes('mac')
-
-export const addSelectionShortcutLabel = () => (isMacPlatform() ? '⌘L' : 'Ctrl+L')
+export const addSelectionShortcutLabel = formatCombo('mod+l')
 
 export function isAddSelectionShortcut(event: KeyboardEvent) {
-  const mod = isMacPlatform() ? event.metaKey : event.ctrlKey
+  const mod = event[modKey]
 
   return mod && !event.shiftKey && event.key.toLowerCase() === 'l'
 }

@@ -1,4 +1,5 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
+import { formatCombo } from '@/lib/keybinds/combo'
 
 import { defineLocale } from './define-locale'
 
@@ -618,7 +619,7 @@ export const zhHant = defineLocale({
       loading: '正在載入已封存工作階段…',
       archivedTitle: '已封存工作階段',
       archivedIntro:
-        '已封存的聊天會從側邊欄隱藏，但保留全部訊息。在側邊欄 Ctrl/⌘ 點擊聊天即可封存。',
+        `已封存的聊天會從側邊欄隱藏，但保留全部訊息。在側邊欄 ${formatCombo('mod')} 點擊聊天即可封存。`,
       emptyArchivedTitle: '暫無封存',
       emptyArchivedDesc: '封存一個聊天後會顯示在這裡。',
       unarchive: '取消封存',
@@ -1749,7 +1750,7 @@ export const zhHant = defineLocale({
       loadingQuestion: '正在載入問題…',
       other: '其他（輸入您的答案）',
       placeholder: '輸入您的答案…',
-      shortcut: '⌘/Ctrl + Enter 傳送',
+      shortcut: `${formatCombo('mod+enter')} 傳送`,
       back: '返回',
       skip: '略過',
       send: '傳送'
