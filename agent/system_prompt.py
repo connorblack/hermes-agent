@@ -221,6 +221,28 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if _env_hints:
         stable_parts.append(_env_hints)
 
+    # Coding posture (base Hermes, any interactive coding surface in a code
+    # workspace — see agent/coding_context.py). The operating brief + the live
+    # git/workspace snapshot are built once here and cached for the session;
+    # the snapshot is never re-probed per turn (that would break the prompt
+    # cache), so the brief tells the model to re-check git before relying on it.
+    if agent.valid_tool_names:
+        try:
+            from agent.coding_context import (
+                CODING_AGENT_GUIDANCE,
+                build_coding_workspace_block,
+                is_coding_context,
+            )
+
+            if is_coding_context(platform=agent.platform, cwd=resolve_context_cwd()):
+                stable_parts.append(CODING_AGENT_GUIDANCE)
+                _workspace = build_coding_workspace_block(resolve_context_cwd())
+                if _workspace:
+                    stable_parts.append(_workspace)
+        except Exception:
+            # Coding-context probing must never block prompt build.
+            pass
+
     # Local Python toolchain probe — names python/pip/uv/PEP-668 state when
     # something is non-default so the model can pick the right install
     # strategy without discovering by failure.  Emits a single line; emits

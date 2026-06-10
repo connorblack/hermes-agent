@@ -863,6 +863,15 @@ DEFAULT_CONFIG = {
         # identity slot (SOUL.md). Empty by default. The HERMES_ENVIRONMENT_HINT
         # env var overrides this (build-time/container mechanism).
         "environment_hint": "",
+        # Coding posture — on interactive coding surfaces (CLI, TUI, desktop
+        # app, ACP) Hermes collapses to the coding toolset and adds a
+        # Cursor-style operating brief + a live git/workspace snapshot. See
+        # agent/coding_context.py.
+        #   "auto" (default) — on when the surface is interactive AND cwd is a
+        #                      git repo; messaging platforms are never affected.
+        #   "on"             — force it everywhere (incl. non-git dirs).
+        #   "off"            — disable entirely (legacy full-toolset behavior).
+        "coding_context": "auto",
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
