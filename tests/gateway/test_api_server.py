@@ -3527,10 +3527,10 @@ class TestResponsesReasoningItems:
 
     @staticmethod
     async def _agent_with_reasoning(reasoning_text, **kwargs):
-        progress_cb = kwargs.get("tool_progress_callback")
+        reasoning_cb = kwargs.get("reasoning_callback")
         text_cb = kwargs.get("stream_delta_callback")
-        if progress_cb:
-            progress_cb("reasoning.available", "_thinking", reasoning_text, None)
+        if reasoning_cb:
+            reasoning_cb(reasoning_text)
         if text_cb:
             text_cb("Done.")
         return (
@@ -3552,7 +3552,10 @@ class TestResponsesReasoningItems:
         """Default behavior is unchanged: no reasoning events, text untouched."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
+            seen_kwargs = {}
+
             async def _mock_run_agent(**kwargs):
+                seen_kwargs.update(kwargs)
                 return await self._agent_with_reasoning("Plan: check the dates first.", **kwargs)
 
             with (
@@ -3569,6 +3572,8 @@ class TestResponsesReasoningItems:
                 assert "reasoning_summary" not in body
                 assert "Plan: check the dates first." not in body
                 assert "Done." in body
+                # Gate off => the agent is not even wired for reasoning deltas.
+                assert seen_kwargs.get("reasoning_callback") is None
 
     @pytest.mark.asyncio
     async def test_stream_gate_on_emits_reasoning_item_events(self, adapter):
@@ -3712,6 +3717,47 @@ class TestResponsesReasoningItems:
                 )
                 assert resp.status == 200
                 assert mock_run.call_args.kwargs["user_message"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_stream_reasoning_deltas_accumulate_into_one_item(self, adapter):
+        """Multiple reasoning deltas before text form a single reasoning item."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                reasoning_cb = kwargs.get("reasoning_callback")
+                text_cb = kwargs.get("stream_delta_callback")
+                if reasoning_cb:
+                    reasoning_cb("Plan: check ")
+                    reasoning_cb("the dates first.")
+                if text_cb:
+                    text_cb("Done.")
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_reasoning_items_enabled", return_value=True),
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+            events = _parse_sse_events(body)
+            deltas = [d for n, d in events if n == "response.reasoning_summary_text.delta"]
+            assert [d["delta"] for d in deltas] == ["Plan: check ", "the dates first."]
+            done_items = [
+                d["item"] for n, d in events
+                if n == "response.output_item.done" and d.get("item", {}).get("type") == "reasoning"
+            ]
+            assert len(done_items) == 1
+            assert done_items[0]["summary"] == [
+                {"type": "summary_text", "text": "Plan: check the dates first."}
+            ]
 
     @pytest.mark.asyncio
     async def test_stream_whitespace_only_reasoning_is_skipped(self, adapter):
