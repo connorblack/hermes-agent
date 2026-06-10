@@ -3719,17 +3719,26 @@ class TestSessionKeyHeader:
 
 
 def _parse_sse_events(body: str):
-    """Parse an SSE body into a list of (event_name, data_dict) tuples."""
+    """Parse an SSE body into a list of (event_name, data_dict) tuples.
+
+    Spec-correct: multiple ``data:`` lines in one block are concatenated
+    with newlines before parsing; non-JSON payloads (e.g. ``[DONE]``
+    sentinels) are skipped rather than raising.
+    """
     events = []
     for block in body.split("\n\n"):
-        name, data = None, None
+        name, data_lines = None, []
         for line in block.splitlines():
             if line.startswith("event: "):
                 name = line[len("event: "):]
             elif line.startswith("data: "):
-                data = json.loads(line[len("data: "):])
-        if name is not None and data is not None:
-            events.append((name, data))
+                data_lines.append(line[len("data: "):])
+        if name is None or not data_lines:
+            continue
+        try:
+            events.append((name, json.loads("\n".join(data_lines))))
+        except ValueError:
+            continue
     return events
 
 
@@ -3762,6 +3771,16 @@ class TestResponsesReasoningItems:
             assert adapter._reasoning_items_enabled() is True
         with patch("gateway.run._load_gateway_config", return_value={}):
             assert adapter._reasoning_items_enabled() is False
+
+    def test_reasoning_items_enabled_logs_and_defaults_off_on_error(self, adapter, caplog):
+        import logging
+
+        with (
+            patch("gateway.run._load_gateway_config", side_effect=RuntimeError("config exploded")),
+            caplog.at_level(logging.DEBUG, logger="gateway.platforms.api_server"),
+        ):
+            assert adapter._reasoning_items_enabled() is False
+        assert any("show_reasoning" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_stream_gate_off_omits_reasoning_items(self, adapter):

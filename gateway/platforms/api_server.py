@@ -1079,7 +1079,13 @@ class APIServerAdapter(BasePlatformAdapter):
             return bool(resolve_display_setting(
                 _load_gateway_config(), "api_server", "show_reasoning", False,
             ))
-        except Exception:
+        except Exception as exc:
+            # Broad on purpose — config load can raise import/parse/IO errors,
+            # and a broken config must not 500 every /v1/responses request — but
+            # never silently: surface why the gate fell back to off.
+            logger.debug(
+                "show_reasoning gate resolution failed; defaulting to off: %s", exc
+            )
             return False
 
     # ------------------------------------------------------------------
@@ -2937,8 +2943,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         if isinstance(_first, dict):
                             _text = _first.get("text", "")
                             if len(_text) > 1000:
+                                # Mutate the first part in place; keep any
+                                # remaining summary parts intact (don't collapse
+                                # the list to a single element).
                                 _first["text"] = _text[:500] + "...[" + str(len(_text) - 500) + " more chars]"
-                                _item["summary"] = [_first]
 
             final_items.append({
                 "type": "message",
