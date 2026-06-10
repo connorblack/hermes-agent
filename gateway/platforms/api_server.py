@@ -2526,20 +2526,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     "summary_index": 0,
                     "text": text,
                 })
+                done_item = {
+                    "id": item_id,
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": text}],
+                    "status": "completed",
+                }
                 await _write_event("response.output_item.done", {
                     "type": "response.output_item.done",
                     "output_index": idx,
-                    "item": {
-                        "id": item_id,
-                        "type": "reasoning",
-                        "summary": [{"type": "summary_text", "text": text}],
-                        "status": "completed",
-                    },
+                    "item": done_item,
                 })
-                emitted_items.append({
-                    "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": text}],
-                })
+                # The same dict lands in the final envelope so the streamed
+                # and stored shapes cannot drift (id/status preserved for
+                # clients that correlate by item id).
+                emitted_items.append(done_item)
 
             # Main drain loop — thread-safe queue fed by agent callbacks.
             async def _dispatch(it) -> None:
@@ -2910,6 +2911,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             for i, entry in enumerate(raw_history):
+                # Echoed reasoning output items carry no role/content —
+                # skip them here exactly like the input array does, instead
+                # of rejecting the whole request (#21655).
+                if isinstance(entry, dict) and str(entry.get("type") or "").strip().lower() == "reasoning":
+                    continue
                 if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
                     return web.json_response(
                         _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
@@ -2952,6 +2958,9 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = stored_session_id or str(uuid.uuid4())
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        # Resolved once per request so the streamed events and the final
+        # envelope can never disagree on the gate.
+        show_reasoning = self._reasoning_items_enabled()
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -2966,8 +2975,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
-            show_reasoning = self._reasoning_items_enabled()
-
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
                 """Surface reasoning availability in the Responses stream.
 
@@ -2977,8 +2984,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 by ``display.platforms.api_server.show_reasoning`` — so the
                 SSE writer can emit a spec-shaped ``reasoning`` output item
                 (#21655, #7556).  Other progress events stay ignored.
+                Whitespace-only text is dropped to match the batch path.
                 """
-                if show_reasoning and event_type == "reasoning.available" and preview:
+                if show_reasoning and event_type == "reasoning.available" \
+                        and preview and str(preview).strip():
                     _stream_q.put(("__reasoning__", {"text": str(preview)}))
 
             def _on_tool_start(tool_call_id, function_name, function_args):
@@ -3096,7 +3105,7 @@ class APIServerAdapter(BasePlatformAdapter):
         output_items = self._extract_output_items(
             result,
             start_index=output_start_index,
-            include_reasoning=self._reasoning_items_enabled(),
+            include_reasoning=show_reasoning,
         )
 
         response_data = {
@@ -3509,8 +3518,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 reasoning_text = msg.get("reasoning_content") or msg.get("reasoning")
                 if isinstance(reasoning_text, str) and reasoning_text.strip():
                     items.append({
+                        "id": f"rs_{uuid.uuid4().hex[:24]}",
                         "type": "reasoning",
                         "summary": [{"type": "summary_text", "text": reasoning_text}],
+                        "status": "completed",
                     })
             if role == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:

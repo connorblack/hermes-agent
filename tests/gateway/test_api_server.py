@@ -3618,6 +3618,9 @@ class TestResponsesReasoningItems:
             reasoning_items = [it for it in output if it.get("type") == "reasoning"]
             assert len(reasoning_items) == 1
             assert reasoning_items[0]["summary"][0]["text"] == "Plan: check the dates first."
+            # Envelope item carries the same correlation fields as the streamed item.
+            assert reasoning_items[0]["id"] == done_items[0]["id"]
+            assert reasoning_items[0]["status"] == "completed"
             message_items = [it for it in output if it.get("type") == "message"]
             assert message_items and message_items[-1]["content"][0]["text"] == "Done."
 
@@ -3711,6 +3714,57 @@ class TestResponsesReasoningItems:
                 assert mock_run.call_args.kwargs["user_message"] == "hello"
 
     @pytest.mark.asyncio
+    async def test_stream_whitespace_only_reasoning_is_skipped(self, adapter):
+        """Whitespace-only reasoning text emits nothing (matches the batch strip check)."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return await self._agent_with_reasoning("  \n\t ", **kwargs)
+
+            with (
+                patch.object(adapter, "_reasoning_items_enabled", return_value=True),
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert '"type": "reasoning"' not in body
+                assert "reasoning_summary" not in body
+
+    @pytest.mark.asyncio
+    async def test_conversation_history_ignores_echoed_reasoning_items(self, adapter):
+        """Echoed reasoning items in conversation_history are skipped, not 400ed."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                return (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "actual question",
+                        "conversation_history": [
+                            {"role": "user", "content": "first question"},
+                            {"type": "reasoning", "id": "rs_1",
+                             "summary": [{"type": "summary_text", "text": "earlier thinking"}]},
+                            {"role": "assistant", "content": "earlier answer"},
+                        ],
+                    },
+                )
+                assert resp.status == 200
+                history = mock_run.call_args.kwargs["conversation_history"]
+                assert all(m.get("content") for m in history)
+                assert all(m.get("type") != "reasoning" for m in history)
+
+    @pytest.mark.asyncio
     async def test_batch_envelope_includes_reasoning_item_when_enabled(self, adapter):
         """Non-streaming envelope mirrors the gate: reasoning item from message fields."""
         app = _create_app(adapter)
@@ -3742,6 +3796,8 @@ class TestResponsesReasoningItems:
                 reasoning_items = [it for it in data["output"] if it.get("type") == "reasoning"]
                 assert len(reasoning_items) == 1
                 assert reasoning_items[0]["summary"][0]["text"] == "thought about it"
+                assert reasoning_items[0]["id"].startswith("rs_")
+                assert reasoning_items[0]["status"] == "completed"
 
             with (
                 patch.object(adapter, "_reasoning_items_enabled", return_value=False),
