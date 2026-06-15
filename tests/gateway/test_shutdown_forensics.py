@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -130,6 +132,23 @@ class TestFormatters:
         assert "parent_pid=" in line
         assert "parent_cmdline=" in line
 
+    def test_format_context_for_log_preserves_non_systemd_legacy_shape(self):
+        ctx = {
+            "signal": "SIGTERM",
+            "under_systemd": False,
+            "parent": {"pid": 123, "name": "bash", "cmdline": "bash -lc hermes"},
+            "loadavg_1m": 1.25,
+            "unit_name": "should-not-log.service",
+            "n_restarts": 4,
+        }
+
+        line = sf.format_context_for_log(ctx)
+
+        assert line == (
+            "signal=SIGTERM under_systemd=no parent_pid=123 parent_name=bash "
+            "loadavg_1m=1.25 parent_cmdline='bash -lc hermes'"
+        )
+
     def test_context_as_json_round_trips(self):
         ctx = sf.snapshot_shutdown_context(signal.SIGTERM)
         payload = sf.context_as_json(ctx)
@@ -144,6 +163,147 @@ class TestFormatters:
         decoded = json.loads(payload)
         assert decoded["signal"] == "SIGTERM"
         assert "weird" in decoded
+
+
+# ---------------------------------------------------------------------------
+# systemd shutdown enrichment
+# ---------------------------------------------------------------------------
+
+class TestSystemdShutdownEnrichment:
+    @staticmethod
+    def _completed(cmd, stdout="", returncode=0):
+        return subprocess.CompletedProcess(cmd, returncode, stdout, "")
+
+    def test_sigterm_with_invocation_id_and_dbus_reachable(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "abc123")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            sf,
+            "_derive_unit_name_from_cgroup",
+            lambda path="/proc/self/cgroup": "hermes-gateway.service",
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "systemctl" and "show" in cmd:
+                return self._completed(
+                    cmd,
+                    "Id=hermes-gateway.service\n"
+                    "NRestarts=9\n"
+                    "StartLimitBurst=5\n"
+                    "StartLimitIntervalUSec=10s\n",
+                )
+            if cmd[0] == "systemctl" and "status" in cmd:
+                return self._completed(
+                    cmd,
+                    "● hermes-gateway.service\n"
+                    "     Active: active (running) since Fri\n"
+                    "      Reason: watchdog-refresh\n",
+                )
+            if cmd[0] == "busctl" and "call" in cmd:
+                return self._completed(
+                    cmd, 'o "/org/freedesktop/systemd1/unit/hermes_2dgateway_2eservice"\n'
+                )
+            if cmd[0] == "busctl" and "get-property" in cmd:
+                return self._completed(cmd, "u 4\n")
+            raise AssertionError(cmd)
+
+        monkeypatch.setattr(sf.subprocess, "run", fake_run)
+
+        ctx = sf.snapshot_shutdown_context(signal.SIGTERM)
+        line = sf.format_context_for_log(ctx)
+
+        assert ctx["unit_name"] == "hermes-gateway.service"
+        assert ctx["invocation_id"] == "abc123"
+        assert ctx["n_restarts"] == 4
+        assert ctx["n_restarts_source"] == "dbus"
+        assert "recent_status_reason='Active: active (running) since Fri; Reason: watchdog-refresh'" in line
+        assert line.index("unit_name=hermes-gateway.service") < line.index("invocation_id=abc123") < line.index("n_restarts=4")
+
+    def test_sigterm_with_dbus_unreachable_falls_back_to_systemctl_show(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "abc123")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            sf,
+            "_derive_unit_name_from_cgroup",
+            lambda path="/proc/self/cgroup": "hermes-gateway.service",
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "busctl":
+                raise FileNotFoundError("busctl missing")
+            if cmd[0] == "systemctl" and "show" in cmd:
+                return self._completed(
+                    cmd,
+                    "Id=hermes-gateway.service\n"
+                    "NRestarts=7\n"
+                    "StartLimitBurst=5\n"
+                    "StartLimitIntervalUSec=10s\n",
+                )
+            if cmd[0] == "systemctl" and "status" in cmd:
+                return self._completed(cmd, "", returncode=1)
+            raise AssertionError(cmd)
+
+        monkeypatch.setattr(sf.subprocess, "run", fake_run)
+
+        ctx = sf.snapshot_shutdown_context(signal.SIGTERM)
+        line = sf.format_context_for_log(ctx)
+
+        assert ctx["n_restarts"] == 7
+        assert ctx["n_restarts_source"] == "systemctl"
+        assert "unit_name=hermes-gateway.service" in line
+        assert "_introspection=degraded" not in line
+
+    def test_sigterm_with_all_introspection_sources_absent_degrades(self, monkeypatch):
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.setattr(sf.os, "getppid", lambda: 1)
+        monkeypatch.setattr(sf, "_candidate_unit_names", lambda ctx: [])
+
+        ctx = sf.snapshot_shutdown_context(signal.SIGTERM)
+        line = sf.format_context_for_log(ctx)
+
+        assert ctx["under_systemd"] is True
+        assert "unit_name=" not in line
+        assert "_introspection=degraded" in line
+
+    def test_post_start_reason_classification_covers_all_cases(self):
+        assert sf._classify_post_start_reason(None, {}) == "boot"
+        assert (
+            sf._classify_post_start_reason({"shutdown_kind": "signal", "signal": "SIGTERM"}, {})
+            == "restart_after_signal"
+        )
+        assert (
+            sf._classify_post_start_reason({"shutdown_kind": "exception", "signal": "RuntimeError"}, {})
+            == "crash_recovery"
+        )
+        assert (
+            sf._classify_post_start_reason(
+                {"shutdown_kind": "signal", "signal": "SIGTERM"},
+                {"n_restarts": 5, "start_limit_burst": 5, "start_limit_interval_usec": "10s"},
+            )
+            == "restart_after_crash_loop"
+        )
+
+    def test_post_start_reason_emitted_once_from_runtime_marker(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RUNTIME_DIR", str(tmp_path))
+        monkeypatch.setenv("INVOCATION_ID", "abc123")
+        marker_path = sf._shutdown_marker_path()
+        marker_path.write_text(
+            json.dumps({"shutdown_kind": "signal", "signal": "SIGTERM"}),
+            encoding="utf-8",
+        )
+        logger = MagicMock()
+
+        reason = sf.emit_gateway_post_start_reason(
+            logger,
+            systemd_details={"unit_name": "hermes-gateway.service", "n_restarts": 2},
+        )
+
+        assert reason == "restart_after_signal"
+        assert not marker_path.exists()
+        logger.info.assert_called_once_with(
+            "Post-start context: %s",
+            "post_start_reason=restart_after_signal unit_name=hermes-gateway.service n_restarts=2",
+        )
 
 
 # ---------------------------------------------------------------------------

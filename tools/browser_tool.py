@@ -2089,6 +2089,12 @@ def _run_browser_command(
             proc.wait()
             logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
                            command, timeout, task_id, task_socket_dir)
+            # A command timeout leaves three separate resources at risk: the
+            # supervisor's persistent CDP websocket, the agent-browser daemon
+            # (plus browser children), and the per-session socket directory.
+            # Reap the whole session immediately so the next browser command
+            # gets a fresh session instead of reconnecting to poisoned state.
+            cleanup_session(task_id)
             result = {"success": False, "error": f"Command timed out after {timeout} seconds"}
             # Fall through to fallback check below
         else:
@@ -2174,6 +2180,12 @@ def _run_browser_command(
     except Exception as e:
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
+
+    # A successful ``agent-browser close`` has already asked the daemon to
+    # shut down. Finish the same idempotent local bookkeeping/force-reap path
+    # used by timeout cleanup so stale socket directories cannot linger.
+    if command == "close":
+        cleanup_session(task_id)
 
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
@@ -3390,6 +3402,68 @@ def _cleanup_old_recordings(max_age_hours=72):
 # Cleanup and Management Functions
 # ============================================================================
 
+def cleanup_session(session_id: Optional[str]) -> None:
+    """Idempotently tear down one agent-browser session without spawning work.
+
+    This is the hard cleanup path used after command deadlines. It does not
+    invoke ``agent-browser close`` or ``record stop`` because those are exactly
+    the subprocess/CDP paths that may already be wedged. Instead it closes the
+    persistent CDP supervisor websocket, drops in-memory ownership, terminates
+    the agent-browser daemon process tree when a PID file exists, closes the
+    cloud-provider session if one is attached, and removes the per-session
+    socket/temp directory. Safe to call multiple times.
+    """
+    if session_id is None:
+        session_id = "default"
+
+    # Stop the CDP supervisor first so any persistent websocket and in-flight
+    # CDP request are cancelled before the underlying browser endpoint dies.
+    _stop_cdp_supervisor(session_id)
+
+    with _cleanup_lock:
+        session_info = _active_sessions.pop(session_id, None)
+        _session_last_activity.pop(session_id, None)
+        _recording_sessions.discard(session_id)
+        for task_key, active_key in list(_last_active_session_key.items()):
+            if active_key == session_id or task_key == session_id:
+                _last_active_session_key.pop(task_key, None)
+
+    if not session_info:
+        return
+
+    bb_session_id = session_info.get("bb_session_id")
+    if bb_session_id:
+        provider = _get_cloud_provider()
+        if provider is not None:
+            try:
+                provider.close_session(bb_session_id)
+            except Exception as e:
+                logger.warning("Could not close cloud browser session: %s", e)
+
+    session_name = session_info.get("session_name", "")
+    if not session_name:
+        return
+
+    socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{session_name}")
+    if not os.path.exists(socket_dir):
+        return
+
+    pid_file = os.path.join(socket_dir, f"{session_name}.pid")
+    if os.path.isfile(pid_file):
+        try:
+            from tools.process_registry import ProcessRegistry
+
+            daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
+            ProcessRegistry._terminate_host_pid(daemon_pid)
+            logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
+        except (ProcessLookupError, ValueError, PermissionError, OSError):
+            logger.debug(
+                "Could not kill daemon pid for %s (already dead or inaccessible)",
+                session_name,
+            )
+    shutil.rmtree(socket_dir, ignore_errors=True)
+
+
 def cleanup_browser(task_id: Optional[str] = None) -> None:
     """
     Clean up browser session(s) for a task.
@@ -3433,10 +3507,6 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
 
 def _cleanup_single_browser_session(task_id: str) -> None:
     """Internal: reap a single browser session by its exact session key."""
-    # Stop the CDP supervisor for this task FIRST so we close our WebSocket
-    # before the backend tears down the underlying CDP endpoint.
-    _stop_cdp_supervisor(task_id)
-
     # Also clean up Camofox session if running in Camofox mode.
     # Skip full close when managed persistence is enabled — the browser
     # profile (and its session cookies) must survive across agent tasks.
@@ -3461,8 +3531,14 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         bb_session_id = session_info.get("bb_session_id", "unknown")
         logger.debug("Found session for task %s: bb_session_id=%s", task_id, bb_session_id)
 
-        # Stop auto-recording before closing (saves the file)
+        # Stop auto-recording before closing (saves the file). If record-stop
+        # itself times out, _run_browser_command will already have hard-cleaned
+        # this session; do not create a fresh session just to issue close.
         _maybe_stop_recording(task_id)
+        with _cleanup_lock:
+            if task_id not in _active_sessions:
+                logger.debug("Session %s was cleaned while stopping recording", task_id)
+                return
 
         # Try to close via agent-browser first (needs session in _active_sessions)
         try:
@@ -3471,40 +3547,11 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         except Exception as e:
             logger.warning("agent-browser close failed for task %s: %s", task_id, e)
 
-        # Now remove from tracking under lock
-        with _cleanup_lock:
-            _active_sessions.pop(task_id, None)
-            _session_last_activity.pop(task_id, None)
-
-        # Cloud mode: close the cloud browser session via provider API.
-        # Local sidecars have bb_session_id=None so this no-ops for them.
-        if bb_session_id:
-            provider = _get_cloud_provider()
-            if provider is not None:
-                try:
-                    provider.close_session(bb_session_id)
-                except Exception as e:
-                    logger.warning("Could not close cloud browser session: %s", e)
-
-        # Kill the daemon process and clean up socket directory
-        session_name = session_info.get("session_name", "")
-        if session_name:
-            socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{session_name}")
-            if os.path.exists(socket_dir):
-                # agent-browser writes {session}.pid in the socket dir
-                pid_file = os.path.join(socket_dir, f"{session_name}.pid")
-                if os.path.isfile(pid_file):
-                    try:
-                        from tools.process_registry import ProcessRegistry
-                        daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
-                        ProcessRegistry._terminate_host_pid(daemon_pid)
-                        logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
-                    except (ProcessLookupError, ValueError, PermissionError, OSError):
-                        logger.debug("Could not kill daemon pid for %s (already dead or inaccessible)", session_name)
-                shutil.rmtree(socket_dir, ignore_errors=True)
+        cleanup_session(task_id)
 
         logger.debug("Removed task %s from active sessions", task_id)
     else:
+        cleanup_session(task_id)
         logger.debug("No active session found for task_id: %s", task_id)
 
 

@@ -13,7 +13,9 @@ import asyncio
 import ipaddress
 import logging
 import socket
-from typing import Iterable, Optional
+import time
+from copy import deepcopy
+from typing import Any, Callable, Iterable, Optional
 
 import httpx
 
@@ -42,11 +44,141 @@ _DOH_PROVIDERS: list[dict] = [
 # endpoints in the 149.154.160.0/20 block (same seed used by OpenClaw).
 _SEED_FALLBACK_IPS: list[str] = ["149.154.167.220"]
 
+_WARNING_SUPPRESSION_WINDOW_SECONDS = 60.0
+
+
+class TelegramNetworkHealth:
+    """Compact, synchronously-updated network diagnostic state for Telegram."""
+
+    def __init__(self) -> None:
+        ts = _now_ts()
+        self._last_dns_resolution: dict[str, Any] = {
+            "hostname": _TELEGRAM_API_HOST,
+            "resolved_ips": [],
+            "resolver_used": "unresolved",
+            "success": False,
+            "error": None,
+            "ts": ts,
+        }
+        self._last_connect_attempt: dict[str, Any] = {
+            "target_ip": None,
+            "family": "v4",
+            "timeout_seconds": None,
+            "success": False,
+            "error": None,
+            "ts": ts,
+        }
+        self._current_path = "offline"
+        self._last_successful_connection_ts: float | None = None
+        self._consecutive_failure_count = 0
+
+    def record_dns_resolution(
+        self,
+        *,
+        hostname: str = _TELEGRAM_API_HOST,
+        resolved_ips: Iterable[str] = (),
+        resolver_used: str,
+        success: bool,
+        error: str | None = None,
+    ) -> None:
+        self._last_dns_resolution = {
+            "hostname": hostname,
+            "resolved_ips": list(resolved_ips),
+            "resolver_used": resolver_used,
+            "success": bool(success),
+            "error": error,
+            "ts": _now_ts(),
+        }
+
+    def record_connect_attempt(
+        self,
+        *,
+        target_ip: str,
+        family: str,
+        timeout_seconds: float | None,
+        success: bool,
+        error: str | None = None,
+        current_path: str | None = None,
+    ) -> None:
+        self._last_connect_attempt = {
+            "target_ip": target_ip,
+            "family": family,
+            "timeout_seconds": timeout_seconds,
+            "success": bool(success),
+            "error": error,
+            "ts": _now_ts(),
+        }
+        if success:
+            self._last_successful_connection_ts = time.time()
+            self._consecutive_failure_count = 0
+            self._current_path = current_path or "primary_dns"
+        else:
+            self._consecutive_failure_count += 1
+            if current_path is not None:
+                self._current_path = current_path
+
+    def snapshot(self) -> dict[str, Any]:
+        if self._last_successful_connection_ts is None:
+            age = None
+        else:
+            age = max(0, int(time.time() - self._last_successful_connection_ts))
+        return {
+            "last_dns_resolution": deepcopy(self._last_dns_resolution),
+            "last_connect_attempt": deepcopy(self._last_connect_attempt),
+            "current_path": self._current_path,
+            "last_successful_connection_age_seconds": age,
+            "consecutive_failure_count": self._consecutive_failure_count,
+        }
+
+
+def _now_ts() -> int:
+    return int(time.time())
+
+
+def _ip_family(value: str) -> str:
+    try:
+        return "v6" if ipaddress.ip_address(value).version == 6 else "v4"
+    except ValueError:
+        return "v4"
+
 
 def _resolve_proxy_url(target_hosts=None) -> str | None:
     # Delegate to shared implementation (env vars + macOS system proxy detection)
     from gateway.platforms.base import resolve_proxy_url
     return resolve_proxy_url("TELEGRAM_PROXY", target_hosts=target_hosts)
+
+
+class _TelegramNetworkWarningRateLimiter:
+    """Collapse repeated network warnings for the same kind/target pair."""
+
+    def __init__(
+        self,
+        window_seconds: float = _WARNING_SUPPRESSION_WINDOW_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.window_seconds = window_seconds
+        self._clock = clock
+        self._events: dict[tuple[str, str], tuple[float, int]] = {}
+
+    def check(self, kind: str, target: str) -> tuple[bool, int]:
+        """Return (should_emit, suppressed_count_since_last_emit)."""
+        key = (kind, target)
+        now = self._clock()
+        previous = self._events.get(key)
+        if previous is None:
+            self._events[key] = (now, 0)
+            return True, 0
+
+        last_emitted_at, suppressed_count = previous
+        if now - last_emitted_at >= self.window_seconds:
+            self._events[key] = (now, 0)
+            return True, suppressed_count
+
+        self._events[key] = (last_emitted_at, suppressed_count + 1)
+        return False, 0
+
+    def clear(self, kind: str, target: str) -> None:
+        self._events.pop((kind, target), None)
 
 
 class TelegramFallbackTransport(httpx.AsyncBaseTransport):
@@ -58,8 +190,17 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
     ``curl --resolve api.telegram.org:443:<ip>``.
     """
 
-    def __init__(self, fallback_ips: Iterable[str], **transport_kwargs):
+    def __init__(
+        self,
+        fallback_ips: Iterable[str],
+        *,
+        health: TelegramNetworkHealth | None = None,
+        connect_timeout_seconds: float | None = 10.0,
+        **transport_kwargs,
+    ):
         self._fallback_ips = list(dict.fromkeys(_normalize_fallback_ips(fallback_ips)))
+        self._health = health or TelegramNetworkHealth()
+        self._connect_timeout_seconds = connect_timeout_seconds
         proxy_url = _resolve_proxy_url(target_hosts=[_TELEGRAM_API_HOST, *self._fallback_ips])
         if proxy_url and "proxy" not in transport_kwargs:
             transport_kwargs["proxy"] = proxy_url
@@ -69,6 +210,8 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         }
         self._sticky_ip: Optional[str] = None
         self._sticky_lock = asyncio.Lock()
+        self._warning_limiter = _TelegramNetworkWarningRateLimiter()
+        self._primary_connectivity_degraded = False
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:
@@ -86,13 +229,27 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         for ip in attempt_order:
             candidate = request if ip is None else _rewrite_request_for_ip(request, ip)
             transport = self._primary if ip is None else self._fallbacks[ip]
+            target = ip or _TELEGRAM_API_HOST
+            path = "primary_dns" if ip is None else f"fallback_ip:{ip}"
             try:
                 response = await transport.handle_async_request(candidate)
+                self._health.record_connect_attempt(
+                    target_ip=target,
+                    family=_ip_family(target),
+                    timeout_seconds=self._connect_timeout_seconds,
+                    success=True,
+                    error=None,
+                    current_path=path,
+                )
+                if ip is None:
+                    self._log_primary_recovered_once()
                 if ip is not None and self._sticky_ip != ip:
                     async with self._sticky_lock:
                         if self._sticky_ip != ip:
                             self._sticky_ip = ip
-                            logger.warning(
+                            self._log_rate_limited_warning(
+                                "sticky_fallback_promoted",
+                                ip,
                                 "[Telegram] Primary api.telegram.org path unreachable; using sticky fallback IP %s",
                                 ip,
                             )
@@ -101,32 +258,74 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 last_error = exc
                 if not _is_retryable_connect_error(exc):
                     raise
+                self._health.record_connect_attempt(
+                    target_ip=target,
+                    family=_ip_family(target),
+                    timeout_seconds=self._connect_timeout_seconds,
+                    success=False,
+                    error=str(exc),
+                    current_path="offline",
+                )
                 if ip is not None and ip == self._sticky_ip:
                     async with self._sticky_lock:
                         if self._sticky_ip == ip:
                             self._sticky_ip = None
-                            logger.warning(
+                            self._log_rate_limited_warning(
+                                "sticky_fallback_failed",
+                                ip,
                                 "[Telegram] Sticky fallback IP %s failed; resetting to primary DNS path",
                                 ip,
                             )
                 if ip is None:
-                    logger.warning(
+                    self._primary_connectivity_degraded = True
+                    self._log_rate_limited_warning(
+                        "primary_connection_failed",
+                        _TELEGRAM_API_HOST,
                         "[Telegram] Primary api.telegram.org connection failed (%s); trying fallback IPs %s",
                         exc,
                         ", ".join(self._fallback_ips),
                     )
                     continue
-                logger.warning("[Telegram] Fallback IP %s failed: %s", ip, exc)
+                self._log_rate_limited_warning(
+                    "fallback_ip_failed",
+                    ip,
+                    "[Telegram] Fallback IP %s failed: %s",
+                    ip,
+                    exc,
+                )
                 continue
 
         if last_error is None:
             raise RuntimeError("All Telegram fallback IPs exhausted but no error was recorded")
         raise last_error
 
+    def get_health_snapshot(self) -> dict[str, Any]:
+        return self._health.snapshot()
+
     async def aclose(self) -> None:
         await self._primary.aclose()
         for transport in self._fallbacks.values():
             await transport.aclose()
+
+    def _log_rate_limited_warning(
+        self, kind: str, target: str, message: str, *args: object
+    ) -> None:
+        should_emit, suppressed_count = self._warning_limiter.check(kind, target)
+        if not should_emit:
+            return
+        if suppressed_count:
+            message = (
+                f"{message} (suppressed {suppressed_count} similar "
+                f"warnings in the last {int(self._warning_limiter.window_seconds)}s)"
+            )
+        logger.warning(message, *args)
+
+    def _log_primary_recovered_once(self) -> None:
+        if not self._primary_connectivity_degraded:
+            return
+        self._primary_connectivity_degraded = False
+        self._warning_limiter.clear("primary_connection_failed", _TELEGRAM_API_HOST)
+        logger.info("[Telegram] Primary api.telegram.org connection recovered")
 
 
 def _normalize_fallback_ips(values: Iterable[str]) -> list[str]:
@@ -192,7 +391,9 @@ async def _query_doh_provider(
         return []
 
 
-async def discover_fallback_ips() -> list[str]:
+async def discover_fallback_ips(
+    health: TelegramNetworkHealth | None = None,
+) -> list[str]:
     """Auto-discover Telegram API IPs via DNS-over-HTTPS.
 
     Resolves api.telegram.org through Google and Cloudflare DoH and returns all
@@ -228,9 +429,23 @@ async def discover_fallback_ips() -> list[str]:
     validated = _normalize_fallback_ips(candidates)
 
     if validated:
+        if health is not None:
+            health.record_dns_resolution(
+                resolved_ips=validated,
+                resolver_used="dns-over-https",
+                success=True,
+                error=None,
+            )
         logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(validated))
         return validated
 
+    if health is not None:
+        health.record_dns_resolution(
+            resolved_ips=sorted(system_ips),
+            resolver_used="dns-over-https",
+            success=False,
+            error="DoH discovery yielded no usable Telegram A records; using seed fallback IPs",
+        )
     logger.info(
         "DoH discovery yielded no usable IPs (system DNS: %s); using seed fallback IPs %s",
         ", ".join(system_ips) or "unknown",

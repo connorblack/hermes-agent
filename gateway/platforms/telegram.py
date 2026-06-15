@@ -83,6 +83,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.telegram_network import (
     TelegramFallbackTransport,
+    TelegramNetworkHealth,
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
@@ -451,6 +452,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # While True, send() short-circuits to a failure so callers
         # (cron live-adapter branch) fall through to standalone delivery.
         self._send_path_degraded: bool = False
+        self._network_health = TelegramNetworkHealth()
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # Track forum chats where we've already registered bot commands
@@ -795,6 +797,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(configured, str):
             configured = configured.split(",")
         return parse_fallback_ip_env(",".join(str(v) for v in configured) if configured else None)
+
+    def get_health_snapshot(self) -> Dict[str, Any]:
+        """Return the latest compact Telegram network diagnostic payload."""
+        health = getattr(self, "_network_health", None)
+        if health is None:
+            health = TelegramNetworkHealth()
+            self._network_health = health
+        return health.snapshot()
 
     @staticmethod
     def _looks_like_polling_conflict(error: Exception) -> bool:
@@ -1571,7 +1581,7 @@ class TelegramAdapter(BasePlatformAdapter):
             disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in {"1", "true", "yes", "on"})
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
-                fallback_ips = await discover_fallback_ips()
+                fallback_ips = await discover_fallback_ips(health=self._network_health)
                 logger.info(
                     "[%s] Auto-discovered Telegram fallback IPs: %s",
                     self.name,
@@ -1590,11 +1600,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 # polling reconnect + bot API bootstrap/delete_webhook calls.
                 request = HTTPXRequest(
                     **request_kwargs,
-                    httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
+                    httpx_kwargs={
+                        "transport": TelegramFallbackTransport(
+                            fallback_ips,
+                            health=self._network_health,
+                            connect_timeout_seconds=request_kwargs["connect_timeout"],
+                        )
+                    },
                 )
                 get_updates_request = HTTPXRequest(
                     **request_kwargs,
-                    httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
+                    httpx_kwargs={
+                        "transport": TelegramFallbackTransport(
+                            fallback_ips,
+                            health=self._network_health,
+                            connect_timeout_seconds=request_kwargs["connect_timeout"],
+                        )
+                    },
                 )
             elif proxy_url:
                 logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)

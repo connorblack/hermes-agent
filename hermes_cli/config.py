@@ -4091,6 +4091,8 @@ _VALID_CUSTOM_PROVIDER_FIELDS = {
 
 # Fields that look like they should be inside custom_providers, not at root
 _CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode"}
+_BROWSER_CLOUD_PROVIDER_CONFIG_KEY = "browser.cloud_provider"
+_FALLBACK_BROWSER_CLOUD_PROVIDER_KEYS = ("browser-use", "browserbase", "firecrawl")
 
 
 @dataclass
@@ -4100,6 +4102,37 @@ class ConfigIssue:
     severity: str  # "error", "warning"
     message: str
     hint: str
+
+
+def get_valid_browser_cloud_provider_keys() -> Tuple[str, ...]:
+    """Return valid values for ``browser.cloud_provider``.
+
+    ``local`` is a config-level sentinel handled by
+    :func:`agent.browser_registry._resolve`; cloud provider names come from the
+    browser-provider registry after bundled/user plugin discovery. The fallback
+    mirrors the currently bundled browser providers so config checks stay
+    actionable even if plugin discovery fails before the registry is populated.
+    """
+    provider_names: set[str] = set(_FALLBACK_BROWSER_CLOUD_PROVIDER_KEYS)
+    try:
+        import importlib
+
+        plugins_mod = importlib.import_module("hermes_cli.plugins")
+        browser_registry = importlib.import_module("agent.browser_registry")
+
+        plugins_mod._ensure_plugins_discovered()
+        registered = {
+            provider.name.strip()
+            for provider in browser_registry.list_providers()
+            if isinstance(getattr(provider, "name", None), str)
+            and provider.name.strip()
+        }
+        if registered:
+            provider_names = registered
+    except Exception:
+        pass
+    provider_names.add("local")
+    return tuple(sorted(provider_names))
 
 
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
@@ -4117,6 +4150,22 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    # ── browser.cloud_provider must match the registered provider keys ─────
+    browser_cfg = config.get("browser")
+    if isinstance(browser_cfg, dict) and "cloud_provider" in browser_cfg:
+        raw_provider = browser_cfg.get("cloud_provider")
+        provider_value = str(raw_provider or "").strip().lower()
+        if provider_value:
+            valid_browser_providers = get_valid_browser_cloud_provider_keys()
+            if provider_value not in valid_browser_providers:
+                valid_list = ", ".join(valid_browser_providers)
+                issues.append(ConfigIssue(
+                    "error",
+                    f"{_BROWSER_CLOUD_PROVIDER_CONFIG_KEY} has invalid value {raw_provider!r}. "
+                    f"Valid providers: {valid_list}",
+                    f"Change {_BROWSER_CLOUD_PROVIDER_CONFIG_KEY} to one of: {valid_list}",
+                ))
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")
@@ -6220,6 +6269,20 @@ def set_config_value(key: str, value: str):
 # Command handler
 # =============================================================================
 
+def _exit_if_config_errors() -> None:
+    """Fail ``hermes config check`` fast when validation found errors."""
+    issues = validate_config_structure()
+    errors = [issue for issue in issues if issue.severity == "error"]
+    if not errors:
+        return
+
+    print("✗ Config validation failed:", file=sys.stderr)
+    for issue in errors:
+        print(f"  - {issue.message}", file=sys.stderr)
+        print(f"    Hint: {issue.hint}", file=sys.stderr)
+    sys.exit(1)
+
+
 def config_command(args):
     """Handle config subcommands."""
     subcmd = getattr(args, 'config_command', None)
@@ -6306,6 +6369,8 @@ def config_command(args):
         print()
     
     elif subcmd == "check":
+        _exit_if_config_errors()
+
         # Non-interactive check for what's missing
         print()
         print(color("📋 Configuration Status", Colors.CYAN, Colors.BOLD))

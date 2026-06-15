@@ -1,3 +1,4 @@
+import errno
 import importlib
 import logging
 
@@ -24,6 +25,11 @@ def _clear_terminal_env(monkeypatch):
         "MODAL_TOKEN_SECRET",
         "HOME",
         "USERPROFILE",
+        "HERMES_KANBAN_WORKSPACE",
+        "HERMES_WORKSPACE",
+        "WORKSPACE_PATH",
+        "HERMES_HOME",
+        "PWD",
     ]
     for key in keys:
         monkeypatch.delenv(key, raising=False)
@@ -44,6 +50,70 @@ def test_local_terminal_requirements(monkeypatch, caplog):
 
     assert ok is True
     assert "Terminal requirements check failed" not in caplog.text
+
+
+def test_safe_getcwd_valid_cwd_has_no_warning(monkeypatch, caplog, tmp_path):
+    """The normal cwd path keeps existing behavior and emits no new noise."""
+    _clear_terminal_env(monkeypatch)
+    terminal_tool_module._deleted_cwd_warnings.clear()
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setattr(terminal_tool_module.os, "getcwd", lambda: str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        config = terminal_tool_module._get_env_config()
+
+    assert config["cwd"] == str(tmp_path)
+    assert "Process cwd vanished" not in caplog.text
+
+
+def test_deleted_cwd_falls_back_to_configured_terminal_cwd_once(monkeypatch, caplog, tmp_path):
+    _clear_terminal_env(monkeypatch)
+    terminal_tool_module._deleted_cwd_warnings.clear()
+    monkeypatch.setattr(terminal_tool_module, "_last_known_cwd", "/tmp/vanished-worktree")
+    configured_cwd = tmp_path / "configured"
+    workspace_cwd = tmp_path / "workspace"
+    configured_cwd.mkdir()
+    workspace_cwd.mkdir()
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace_cwd))
+    monkeypatch.setattr(terminal_tool_module, "_configured_terminal_cwd", lambda: str(configured_cwd))
+    monkeypatch.setattr(
+        terminal_tool_module.os,
+        "getcwd",
+        lambda: (_ for _ in ()).throw(FileNotFoundError("cwd was deleted")),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        first = terminal_tool_module._get_env_config()
+        second = terminal_tool_module._get_env_config()
+
+    assert first["cwd"] == str(configured_cwd)
+    assert second["cwd"] == str(configured_cwd)
+    warnings = [record.getMessage() for record in caplog.records if "Process cwd vanished" in record.getMessage()]
+    assert warnings == [
+        f"Process cwd vanished (/tmp/vanished-worktree); using terminal cwd fallback {configured_cwd}."
+    ]
+
+
+def test_deleted_cwd_oserror_enoent_falls_back_to_workspace(monkeypatch, tmp_path):
+    _clear_terminal_env(monkeypatch)
+    terminal_tool_module._deleted_cwd_warnings.clear()
+    workspace_cwd = tmp_path / "workspace"
+    hermes_home = tmp_path / "hermes-home"
+    workspace_cwd.mkdir()
+    hermes_home.mkdir()
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace_cwd))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(terminal_tool_module, "_configured_terminal_cwd", lambda: None)
+
+    def _deleted_cwd():
+        raise OSError(errno.ENOENT, "No such file or directory")
+
+    monkeypatch.setattr(terminal_tool_module.os, "getcwd", _deleted_cwd)
+
+    assert terminal_tool_module._get_env_config()["cwd"] == str(workspace_cwd)
+    assert terminal_tool_module.check_terminal_requirements() is True
 
 
 def test_unknown_terminal_env_logs_error_and_returns_false(monkeypatch, caplog):

@@ -15754,10 +15754,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         try:
             from gateway.shutdown_forensics import (
                 format_context_for_log,
+                record_gateway_shutdown_marker,
                 snapshot_shutdown_context,
                 spawn_async_diagnostic,
             )
             _shutdown_ctx = snapshot_shutdown_context(received_signal)
+            record_gateway_shutdown_marker(_shutdown_ctx, hermes_home=_hermes_home)
         except Exception as _e:
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)
@@ -15912,6 +15914,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     success = await runner.start()
     if not success:
         return False
+    try:
+        from gateway.shutdown_forensics import emit_gateway_post_start_reason
+        emit_gateway_post_start_reason(logger, hermes_home=_hermes_home)
+    except Exception as e:
+        logger.debug("post-start shutdown reason logging failed: %s", e)
     if runner.should_exit_cleanly:
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
@@ -16009,7 +16016,25 @@ def main():
     
     # Run the gateway - exit with code 1 if no platforms connected,
     # so systemd Restart=on-failure will retry on transient errors (e.g. DNS)
-    success = asyncio.run(start_gateway(config))
+    try:
+        success = asyncio.run(start_gateway(config))
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        try:
+            from gateway.shutdown_forensics import record_gateway_shutdown_marker
+            record_gateway_shutdown_marker(
+                {
+                    "pid": os.getpid(),
+                    "signal": type(exc).__name__,
+                    "under_systemd": bool(os.environ.get("INVOCATION_ID")) or os.getppid() == 1,
+                },
+                shutdown_kind="exception",
+                hermes_home=_hermes_home,
+            )
+        except Exception:
+            pass
+        raise
     if not success:
         sys.exit(1)
 

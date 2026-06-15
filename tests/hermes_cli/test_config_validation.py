@@ -1,7 +1,62 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
+from types import SimpleNamespace
 
-from hermes_cli.config import validate_config_structure, ConfigIssue
+from hermes_cli.config import (
+    ConfigIssue,
+    config_command,
+    get_valid_browser_cloud_provider_keys,
+    validate_config_structure,
+)
+
+
+class TestBrowserCloudProviderValidation:
+    """browser.cloud_provider must name a registered provider or local."""
+
+    def test_invalid_browserless_provider_is_actionable_error(self):
+        issues = validate_config_structure({
+            "browser": {"cloud_provider": "browserless"},
+        })
+
+        errors = [issue for issue in issues if issue.severity == "error"]
+        assert len(errors) == 1
+        err = errors[0]
+        valid_list = ", ".join(get_valid_browser_cloud_provider_keys())
+        assert "browser.cloud_provider" in err.message
+        assert "browserless" in err.message
+        assert valid_list in err.message
+        assert "browser.cloud_provider" in err.hint
+
+    def test_registered_provider_and_local_are_valid(self):
+        for provider in get_valid_browser_cloud_provider_keys():
+            issues = validate_config_structure({
+                "browser": {"cloud_provider": provider},
+            })
+            assert not [issue for issue in issues if issue.severity == "error"]
+
+    def test_config_check_exits_nonzero_for_invalid_browser_provider(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "browser:\n  cloud_provider: browserless\n",
+            encoding="utf-8",
+        )
+
+        try:
+            config_command(SimpleNamespace(config_command="check"))
+        except SystemExit as exc:
+            exit_code = exc.code
+        else:
+            raise AssertionError("config check should exit non-zero")
+
+        captured = capsys.readouterr()
+        valid_list = ", ".join(get_valid_browser_cloud_provider_keys())
+        assert exit_code == 1
+        assert "browser.cloud_provider" in captured.err
+        assert "browserless" in captured.err
+        assert valid_list in captured.err
+        assert captured.out == ""
 
 
 class TestCustomProvidersValidation:

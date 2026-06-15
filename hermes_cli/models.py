@@ -2148,7 +2148,12 @@ def _merge_with_models_dev(provider: str, curated: list[str]) -> list[str]:
     return merged
 
 
-def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
+def provider_model_ids(
+    provider: Optional[str],
+    *,
+    force_refresh: bool = False,
+    integrator: Optional[str] = None,
+) -> list[str]:
     """Return the best known model catalog for a provider.
 
     Tries live API endpoints for providers that support them (Codex, Nous),
@@ -2180,7 +2185,10 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
     if normalized in {"copilot", "copilot-acp"}:
         try:
-            live = _fetch_github_models(_resolve_copilot_catalog_api_key())
+            live = _fetch_github_models(
+                _resolve_copilot_catalog_api_key(),
+                integrator=_provider_models_cache_integrator(normalized, integrator),
+            )
             if live:
                 return live
         except Exception:
@@ -2354,8 +2362,11 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 #
 # Cache strategy:
 #   - One JSON file at $HERMES_HOME/provider_models_cache.json
-#   - Per-provider entries keyed by (provider, credential fingerprint)
-#   - Credential fingerprint = sha256 of env-var values that the provider
+#   - Per-provider + per-integrator entries keyed by (provider, integrator,
+#     credential fingerprint). Copilot's /models surface varies by
+#     Copilot-Integration-Id, so vscode-chat and other integrations must not
+#     share one provider-level cache entry.
+#   - Credential fingerprint = hash of env-var values that the provider
 #     normally reads. Swap your OPENAI_API_KEY and the entry invalidates.
 #   - 1h TTL by default. `force_refresh=True` skips the cache entirely
 #     and overwrites it on success.
@@ -2365,6 +2376,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 #     to a live fetch — the picker keeps working.
 
 _PROVIDER_MODELS_CACHE_TTL = 3600  # 1h
+_PROVIDER_MODELS_CACHE_VERSION = 2
+_PROVIDER_MODELS_CACHE_ENTRIES_KEY = "entries"
 
 
 def _provider_models_cache_path() -> Path:
@@ -2467,11 +2480,60 @@ def _save_provider_models_cache(data: dict) -> None:
         pass
 
 
+def _provider_models_cache_integrator(
+    provider: Optional[str],
+    integrator: Optional[str] = None,
+) -> str:
+    """Return the provider-model cache integrator key for *provider*.
+
+    Non-Copilot providers use ``"default"``. Copilot callers may pass an
+    explicit integration id; otherwise derive the current default header value
+    so old provider-only callers still hit a stable provider+integrator cache.
+    """
+    requested = str(integrator or "").strip()
+    if requested:
+        return requested
+
+    normalized = normalize_provider(provider) or str(provider or "").strip()
+    if normalized in {"copilot", "copilot-acp"}:
+        try:
+            header_value = str(
+                copilot_default_headers().get("Copilot-Integration-Id") or ""
+            ).strip()
+            if header_value:
+                return header_value
+        except Exception:
+            pass
+    return "default"
+
+
+def _provider_models_cache_entry_key(provider: str, integrator: str) -> str:
+    return f"{provider}::{integrator}"
+
+
+def _get_provider_models_cache_entry(
+    cache: dict,
+    provider: str,
+    integrator: str,
+) -> Optional[dict]:
+    """Return a v2 provider+integrator cache entry, with v1 fallback."""
+    entries = cache.get(_PROVIDER_MODELS_CACHE_ENTRIES_KEY)
+    if isinstance(entries, dict):
+        entry = entries.get(_provider_models_cache_entry_key(provider, integrator))
+        if isinstance(entry, dict):
+            return entry
+
+    # Backward compatibility with the original provider-only cache shape.
+    entry = cache.get(provider)
+    return entry if isinstance(entry, dict) else None
+
+
 def cached_provider_model_ids(
     provider: Optional[str],
     *,
     force_refresh: bool = False,
     ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL,
+    integrator: Optional[str] = None,
 ) -> list[str]:
     """Disk-cached wrapper around :func:`provider_model_ids`.
 
@@ -2484,7 +2546,8 @@ def cached_provider_model_ids(
 
     cache = _load_provider_models_cache()
     fp = _credential_fingerprint(normalized)
-    entry = cache.get(normalized)
+    integrator_key = _provider_models_cache_integrator(normalized, integrator)
+    entry = _get_provider_models_cache_entry(cache, normalized, integrator_key)
     now = time.time()
 
     if (
@@ -2498,9 +2561,20 @@ def cached_provider_model_ids(
         return list(entry["models"])
 
     # Cache miss / stale / forced refresh — call the live path.
-    live = provider_model_ids(normalized, force_refresh=force_refresh)
+    live = provider_model_ids(
+        normalized,
+        force_refresh=force_refresh,
+        integrator=integrator_key,
+    )
     if live:
-        cache[normalized] = {
+        entries = cache.get(_PROVIDER_MODELS_CACHE_ENTRIES_KEY)
+        if not isinstance(entries, dict):
+            entries = {}
+            cache[_PROVIDER_MODELS_CACHE_ENTRIES_KEY] = entries
+        cache["version"] = _PROVIDER_MODELS_CACHE_VERSION
+        entries[_provider_models_cache_entry_key(normalized, integrator_key)] = {
+            "provider": normalized,
+            "integrator": integrator_key,
             "fp": fp,
             "at": now,
             "models": list(live),
@@ -2521,12 +2595,17 @@ def cached_provider_model_ids(
     return list(live or [])
 
 
-def clear_provider_models_cache(provider: Optional[str] = None) -> None:
-    """Drop a single provider's cache entry, or wipe the whole cache.
+def clear_provider_models_cache(
+    provider: Optional[str] = None,
+    *,
+    integrator: Optional[str] = None,
+) -> None:
+    """Drop provider-model cache entries.
 
-    ``provider=None`` wipes everything; otherwise only that provider's
-    entry is removed. Used by ``/model --refresh`` and
-    ``hermes model --refresh``.
+    ``provider=None`` wipes everything. ``provider`` alone removes all cache
+    entries for that provider (legacy behavior). ``provider`` + ``integrator``
+    removes only that provider+integrator entry, leaving sibling integrators
+    warm. Used by ``/model --refresh`` and ``hermes model --refresh``.
     """
     try:
         if provider is None:
@@ -2536,9 +2615,19 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
             return
         cache = _load_provider_models_cache()
         normalized = normalize_provider(provider) or provider or ""
+        integrator_key = _provider_models_cache_integrator(normalized, integrator)
+        entries = cache.get(_PROVIDER_MODELS_CACHE_ENTRIES_KEY)
+        if isinstance(entries, dict):
+            if integrator is None:
+                prefix = f"{normalized}::"
+                for key in list(entries.keys()):
+                    if str(key).startswith(prefix):
+                        del entries[key]
+            else:
+                entries.pop(_provider_models_cache_entry_key(normalized, integrator_key), None)
         if normalized in cache:
             del cache[normalized]
-            _save_provider_models_cache(cache)
+        _save_provider_models_cache(cache)
     except Exception:
         pass
 
@@ -2625,22 +2714,32 @@ def _payload_items(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def copilot_default_headers() -> dict[str, str]:
+def copilot_default_headers(integrator: Optional[str] = None) -> dict[str, str]:
     """Standard headers for Copilot API requests.
 
     Includes Openai-Intent and x-initiator headers that opencode and the
-    Copilot CLI send on every request.
+    Copilot CLI send on every request. ``integrator`` overrides
+    Copilot-Integration-Id for integrations whose /models catalogs differ.
     """
+    requested_integrator = str(integrator or "").strip()
     try:
         from hermes_cli.copilot_auth import copilot_request_headers
-        return copilot_request_headers(is_agent_turn=True)
+
+        headers = copilot_request_headers(is_agent_turn=True)
+        if requested_integrator:
+            headers["Copilot-Integration-Id"] = requested_integrator
+        return headers
     except ImportError:
-        return {
+        headers = {
             "Editor-Version": COPILOT_EDITOR_VERSION,
             "User-Agent": "HermesAgent/1.0",
+            "Copilot-Integration-Id": "vscode-chat",
             "Openai-Intent": "conversation-edits",
             "x-initiator": "agent",
         }
+        if requested_integrator:
+            headers["Copilot-Integration-Id"] = requested_integrator
+        return headers
 
 
 def _copilot_catalog_item_is_text_model(item: dict[str, Any]) -> bool:
@@ -2673,16 +2772,18 @@ def _copilot_catalog_item_is_text_model(item: dict[str, Any]) -> bool:
 
 
 def fetch_github_model_catalog(
-    api_key: Optional[str] = None, timeout: float = 5.0
+    api_key: Optional[str] = None,
+    timeout: float = 5.0,
+    integrator: Optional[str] = None,
 ) -> Optional[list[dict[str, Any]]]:
     """Fetch the live GitHub Copilot model catalog for this account."""
     attempts: list[dict[str, str]] = []
     if api_key:
         attempts.append({
-            **copilot_default_headers(),
+            **copilot_default_headers(integrator=integrator),
             "Authorization": f"Bearer {api_key}",
         })
-    attempts.append(copilot_default_headers())
+    attempts.append(copilot_default_headers(integrator=integrator))
 
     for headers in attempts:
         req = urllib.request.Request(COPILOT_MODELS_URL, headers=headers)
@@ -2983,8 +3084,16 @@ def lmstudio_model_reasoning_options(
     return []
 
 
-def _fetch_github_models(api_key: Optional[str] = None, timeout: float = 5.0) -> Optional[list[str]]:
-    catalog = fetch_github_model_catalog(api_key=api_key, timeout=timeout)
+def _fetch_github_models(
+    api_key: Optional[str] = None,
+    timeout: float = 5.0,
+    integrator: Optional[str] = None,
+) -> Optional[list[str]]:
+    catalog = fetch_github_model_catalog(
+        api_key=api_key,
+        timeout=timeout,
+        integrator=integrator,
+    )
     if not catalog:
         return None
     return [item.get("id", "") for item in catalog if item.get("id")]

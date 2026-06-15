@@ -32,6 +32,7 @@ Usage:
 """
 
 import importlib.util
+import errno
 import json
 import logging
 import os
@@ -1046,18 +1047,118 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
         )
 
 
+_deleted_cwd_warning_lock = threading.Lock()
+_deleted_cwd_warnings: set[tuple[str, str]] = set()
+_last_known_cwd: Optional[str] = None
+_last_safe_getcwd_used_fallback = False
+
+
+def _existing_absolute_dir(raw_path: Optional[str]) -> Optional[str]:
+    """Return an expanded existing absolute directory, or ``None``.
+
+    When the process cwd has vanished, resolving relative paths can call
+    ``os.getcwd()`` internally and re-trigger the same failure. Fallback
+    candidates therefore must already resolve to absolute paths after ``~`` /
+    env expansion.
+    """
+    if raw_path is None:
+        return None
+    candidate = os.path.expandvars(os.path.expanduser(str(raw_path).strip()))
+    if not candidate or candidate in {".", "auto", "cwd"}:
+        return None
+    if not os.path.isabs(candidate):
+        return None
+    return candidate if os.path.isdir(candidate) else None
+
+
+def _configured_terminal_cwd() -> Optional[str]:
+    """Read terminal.cwd directly from Hermes config without requiring cwd."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        terminal_config = config.get("terminal", {}) if isinstance(config, dict) else {}
+        if isinstance(terminal_config, dict):
+            return _existing_absolute_dir(terminal_config.get("cwd"))
+    except Exception as exc:
+        logger.debug("Could not read configured terminal.cwd while resolving deleted cwd: %s", exc)
+    return None
+
+
+def _active_workspace_cwd() -> Optional[str]:
+    """Return the active Hermes workspace path when one is exported."""
+    for env_var in ("HERMES_KANBAN_WORKSPACE", "HERMES_WORKSPACE", "WORKSPACE_PATH"):
+        candidate = _existing_absolute_dir(os.getenv(env_var))
+        if candidate:
+            return candidate
+    return None
+
+
+def _resolve_deleted_cwd_fallback() -> str:
+    """Resolve the cwd fallback for a process whose cwd was deleted.
+
+    Order is intentionally narrow and deterministic: explicit Hermes config,
+    active Hermes workspace, HERMES_HOME, then the user's home directory. If
+    none exists, raise one clear error so requirement checks do not spin on the
+    original FileNotFoundError.
+    """
+    fallback = (
+        _configured_terminal_cwd()
+        or _active_workspace_cwd()
+        or _existing_absolute_dir(os.getenv("HERMES_HOME"))
+        or _existing_absolute_dir(os.path.expanduser("~"))
+    )
+    if fallback:
+        return fallback
+    raise RuntimeError(
+        "Current working directory was deleted and no terminal cwd fallback exists "
+        "(checked terminal.cwd, active Hermes workspace, HERMES_HOME, and home directory)."
+    )
+
+
+def _warn_deleted_cwd_once(vanished_cwd: str, fallback_cwd: str) -> None:
+    # Log once per vanished→fallback pair per process lifetime. Repeated
+    # requirement checks after the same deleted cwd are therefore quiet, while a
+    # later distinct deletion still produces a diagnostic.
+    key = (vanished_cwd, fallback_cwd)
+    with _deleted_cwd_warning_lock:
+        if key in _deleted_cwd_warnings:
+            return
+        _deleted_cwd_warnings.add(key)
+    logger.warning(
+        "Process cwd vanished (%s); using terminal cwd fallback %s.",
+        vanished_cwd,
+        fallback_cwd,
+    )
+
+
 def _safe_getcwd() -> str:
     """Return the current working directory, tolerating a deleted CWD.
 
     ``os.getcwd()`` raises FileNotFoundError when the process's working
     directory has been removed out from under it (e.g. a scratch workspace
-    that was cleaned up mid-session). Fall back to TERMINAL_CWD, then the
-    user's home directory, so terminal setup never crashes on a stale CWD.
+    that was cleaned up mid-session). Fall back through the Hermes-owned cwd
+    chain so terminal setup never crashes or loops on a stale CWD.
     """
+    global _last_known_cwd, _last_safe_getcwd_used_fallback
     try:
-        return os.getcwd()
+        _last_known_cwd = os.getcwd()
+        _last_safe_getcwd_used_fallback = False
+        return _last_known_cwd
     except FileNotFoundError:
-        return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
+        fallback = _resolve_deleted_cwd_fallback()
+        _last_safe_getcwd_used_fallback = True
+        vanished = _last_known_cwd or os.getenv("PWD") or "<unknown>"
+        _warn_deleted_cwd_once(vanished, fallback)
+        return fallback
+    except OSError as exc:
+        if getattr(exc, "errno", None) != errno.ENOENT:
+            raise
+        fallback = _resolve_deleted_cwd_fallback()
+        _last_safe_getcwd_used_fallback = True
+        vanished = _last_known_cwd or os.getenv("PWD") or "<unknown>"
+        _warn_deleted_cwd_once(vanished, fallback)
+        return fallback
 
 
 def _get_env_config() -> Dict[str, Any]:
@@ -1108,7 +1209,13 @@ def _get_env_config() -> Dict[str, Any]:
     # If Docker cwd passthrough is explicitly enabled, remap the host path to
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
+    if env_type == "local" and _last_safe_getcwd_used_fallback:
+        # The process cwd is gone; keep the deterministic fallback chosen by
+        # _safe_getcwd() instead of letting a stale TERMINAL_CWD resurrect the
+        # same requirement-check failure mode.
+        cwd = default_cwd
+    else:
+        cwd = os.getenv("TERMINAL_CWD", default_cwd)
     if cwd:
         cwd = os.path.expanduser(cwd)
     host_cwd = None

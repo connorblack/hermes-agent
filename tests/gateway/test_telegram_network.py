@@ -15,6 +15,8 @@ path first, and on ConnectTimeout / ConnectError fall through to configured
 fallback IPs in order, then "stick" to whichever IP works.
 """
 
+import logging
+
 import httpx
 import pytest
 
@@ -209,6 +211,58 @@ class TestFallbackTransport:
         assert transport._sticky_ip is None
 
     @pytest.mark.asyncio
+    async def test_health_snapshot_tracks_failed_connect_attempts(self, monkeypatch):
+        calls = []
+        behavior = {"api.telegram.org": "timeout", "149.154.167.220": "timeout"}
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
+
+        transport = tnet.TelegramFallbackTransport(
+            ["149.154.167.220"], connect_timeout_seconds=3.5
+        )
+
+        with pytest.raises(httpx.ConnectTimeout):
+            await transport.handle_async_request(_telegram_request())
+
+        snapshot = transport.get_health_snapshot()
+        assert set(snapshot) == {
+            "last_dns_resolution",
+            "last_connect_attempt",
+            "current_path",
+            "last_successful_connection_age_seconds",
+            "consecutive_failure_count",
+        }
+        assert snapshot["last_dns_resolution"]["hostname"] == "api.telegram.org"
+        assert snapshot["last_connect_attempt"]["target_ip"] == "149.154.167.220"
+        assert snapshot["last_connect_attempt"]["family"] == "v4"
+        assert snapshot["last_connect_attempt"]["timeout_seconds"] == 3.5
+        assert snapshot["last_connect_attempt"]["success"] is False
+        assert snapshot["last_connect_attempt"]["error"] == "timed out"
+        assert snapshot["last_connect_attempt"]["ts"] is not None
+        assert snapshot["current_path"] == "offline"
+        assert snapshot["last_successful_connection_age_seconds"] is None
+        assert snapshot["consecutive_failure_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_health_snapshot_success_resets_failures_and_updates_age(self, monkeypatch):
+        calls = []
+        behavior = {"api.telegram.org": "timeout", "149.154.167.220": "ok"}
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
+        now = {"value": 1000.0}
+        monkeypatch.setattr(tnet.time, "time", lambda: now["value"])
+
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+        await transport.handle_async_request(_telegram_request())
+
+        snapshot = transport.get_health_snapshot()
+        assert snapshot["current_path"] == "fallback_ip:149.154.167.220"
+        assert snapshot["consecutive_failure_count"] == 0
+        assert snapshot["last_successful_connection_age_seconds"] == 0
+        assert snapshot["last_connect_attempt"]["success"] is True
+
+        now["value"] = 1042.0
+        assert transport.get_health_snapshot()["last_successful_connection_age_seconds"] == 42
+
+    @pytest.mark.asyncio
     async def test_multiple_fallback_ips_tried_in_order(self, monkeypatch):
         calls = []
         behavior = {
@@ -257,6 +311,95 @@ class TestFallbackTransport:
         # Path: sticky (.220) → primary (api.telegram.org) → .221
         assert [c["url_host"] for c in calls] == ["149.154.167.220", "api.telegram.org", "149.154.167.221"]
         assert transport._sticky_ip == "149.154.167.221"
+
+    @pytest.mark.asyncio
+    async def test_rate_limits_identical_failure_warnings_within_window(
+        self, monkeypatch, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger=tnet.logger.name)
+        calls = []
+        behavior = {"api.telegram.org": "timeout", "149.154.167.220": "timeout"}
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
+
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+
+        for _ in range(50):
+            with pytest.raises(httpx.ConnectTimeout):
+                await transport.handle_async_request(_telegram_request())
+
+        messages = [record.getMessage() for record in caplog.records]
+        primary_failures = [
+            message
+            for message in messages
+            if "Primary api.telegram.org connection failed" in message
+        ]
+        fallback_failures = [
+            message for message in messages if "Fallback IP 149.154.167.220 failed" in message
+        ]
+        assert len(primary_failures) == 1
+        assert len(fallback_failures) == 1
+
+    @pytest.mark.asyncio
+    async def test_rate_limits_repeated_sticky_reset_warnings(self, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING, logger=tnet.logger.name)
+        calls = []
+        behavior = {"api.telegram.org": "timeout", "149.154.167.220": "timeout"}
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
+
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+
+        for _ in range(50):
+            transport._sticky_ip = "149.154.167.220"
+            with pytest.raises(httpx.ConnectTimeout):
+                await transport.handle_async_request(_telegram_request())
+
+        sticky_resets = [
+            record.getMessage()
+            for record in caplog.records
+            if "Sticky fallback IP 149.154.167.220 failed; resetting" in record.getMessage()
+        ]
+        assert len(sticky_resets) == 1
+
+    @pytest.mark.asyncio
+    async def test_different_failure_kinds_are_logged_independently(
+        self, monkeypatch, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger=tnet.logger.name)
+        calls = []
+        behavior = {"api.telegram.org": "timeout", "149.154.167.220": "timeout"}
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
+
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+
+        with pytest.raises(httpx.ConnectTimeout):
+            await transport.handle_async_request(_telegram_request())
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("Primary api.telegram.org connection failed" in message for message in messages)
+        assert any("Fallback IP 149.154.167.220 failed" in message for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_primary_recovery_is_logged_once(self, monkeypatch, caplog):
+        caplog.set_level(logging.INFO, logger=tnet.logger.name)
+        calls = []
+        behavior = {"api.telegram.org": "timeout", "149.154.167.220": "timeout"}
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
+
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+
+        with pytest.raises(httpx.ConnectTimeout):
+            await transport.handle_async_request(_telegram_request())
+
+        behavior["api.telegram.org"] = "ok"
+        await transport.handle_async_request(_telegram_request())
+        await transport.handle_async_request(_telegram_request())
+
+        recovery_messages = [
+            record.getMessage()
+            for record in caplog.records
+            if "Primary api.telegram.org connection recovered" in record.getMessage()
+        ]
+        assert recovery_messages == ["[Telegram] Primary api.telegram.org connection recovered"]
 
 
 class TestFallbackTransportPassthrough:
@@ -466,6 +609,22 @@ class TestAdapterFallbackIps:
         adapter = self._make_adapter(extra={"fallback_ips": ["149.154.167.220", "not-valid"]})
         assert adapter._fallback_ips() == ["149.154.167.220"]
 
+    def test_health_accessor_returns_compact_payload(self):
+        adapter = self._make_adapter()
+
+        snapshot = adapter.get_health_snapshot()
+
+        assert set(snapshot) == {
+            "last_dns_resolution",
+            "last_connect_attempt",
+            "current_path",
+            "last_successful_connection_age_seconds",
+            "consecutive_failure_count",
+        }
+        assert snapshot["last_dns_resolution"]["hostname"] == "api.telegram.org"
+        assert snapshot["last_successful_connection_age_seconds"] is None
+        assert snapshot["consecutive_failure_count"] == 0
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DoH auto-discovery
@@ -534,6 +693,27 @@ class TestDiscoverFallbackIps:
         ips = await tnet.discover_fallback_ips()
         assert "149.154.167.220" in ips
         assert "149.154.167.221" in ips
+
+    @pytest.mark.asyncio
+    async def test_dns_discovery_updates_health_snapshot(self, monkeypatch):
+        self._patch_doh(monkeypatch, {
+            "https://dns.google": (200, _doh_answer("149.154.167.220")),
+            "https://cloudflare-dns.com": (200, _doh_answer("149.154.167.221")),
+        }, system_dns_ips=["149.154.166.110"])
+        health = tnet.TelegramNetworkHealth()
+
+        ips = await tnet.discover_fallback_ips(health=health)
+
+        snapshot = health.snapshot()
+        assert ips == ["149.154.167.220", "149.154.167.221"]
+        assert snapshot["last_dns_resolution"]["hostname"] == "api.telegram.org"
+        assert snapshot["last_dns_resolution"]["resolved_ips"] == [
+            "149.154.167.220", "149.154.167.221",
+        ]
+        assert snapshot["last_dns_resolution"]["resolver_used"] == "dns-over-https"
+        assert snapshot["last_dns_resolution"]["success"] is True
+        assert snapshot["last_dns_resolution"]["error"] is None
+        assert snapshot["last_dns_resolution"]["ts"] is not None
 
     @pytest.mark.asyncio
     async def test_system_dns_ip_kept_when_doh_confirms(self, monkeypatch):
