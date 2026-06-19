@@ -32,6 +32,7 @@ Requires:
 """
 
 import asyncio
+import copy
 import hashlib
 import hmac
 import json
@@ -2387,6 +2388,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation: Optional[str],
         store: bool,
         session_id: str,
+        show_reasoning: bool = False,
         gateway_session_key: Optional[str] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
@@ -2753,15 +2755,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     "summary": [{"type": "summary_text", "text": text}],
                     "status": "completed",
                 }
+                terminal_item = APIServerAdapter._trim_reasoning_item_for_terminal(
+                    copy.deepcopy(done_item)
+                )
                 await _write_event("response.output_item.done", {
                     "type": "response.output_item.done",
                     "output_index": _open_reasoning["idx"],
-                    "item": done_item,
+                    "item": terminal_item,
                 })
-                # The same dict lands in the final envelope so the streamed
-                # and stored shapes cannot drift (id/status preserved for
-                # clients that correlate by item id).
-                emitted_items.append(done_item)
+                # Keep the streamed terminal item and the final envelope/store
+                # in sync by appending the same trimmed shape we just emitted.
+                emitted_items.append(terminal_item)
                 _open_reasoning = None
 
             # Main drain loop — thread-safe queue fed by agent callbacks.
@@ -2877,6 +2881,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     final_response_text = agent_final
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
                     agent_error = _redact_api_error_text(result["error"])
+                if show_reasoning and not any(
+                    item.get("type") == "reasoning" for item in emitted_items
+                ):
+                    start_index = self._response_messages_turn_start_index(
+                        conversation_history,
+                        user_message,
+                        result,
+                    )
+                    reasoning_items = self._extract_reasoning_items(
+                        result.get("messages", [])[start_index:]
+                    )
+                    emitted_items.extend(
+                        self._trim_reasoning_item_for_terminal(copy.deepcopy(item))
+                        for item in reasoning_items
+                    )
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = _redact_api_error_text(e)
@@ -2937,16 +2956,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _first["text"] = _text[:500] + "...[" + str(len(_text) - 500) + " more chars]"
                                 _item["output"] = [_first]
                 elif _item.get("type") == "reasoning":
-                    _summary = _item.get("summary", [])
-                    if isinstance(_summary, list) and _summary:
-                        _first = _summary[0]
-                        if isinstance(_first, dict):
-                            _text = _first.get("text", "")
-                            if len(_text) > 1000:
-                                # Mutate the first part in place; keep any
-                                # remaining summary parts intact (don't collapse
-                                # the list to a single element).
-                                _first["text"] = _text[:500] + "...[" + str(len(_text) - 500) + " more chars]"
+                    APIServerAdapter._trim_reasoning_item_for_terminal(_item)
 
             final_items.append({
                 "type": "message",
@@ -3284,6 +3294,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 instructions=instructions,
                 conversation=conversation,
                 store=store,
+                show_reasoning=show_reasoning,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
             )
@@ -3826,17 +3837,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if start_index > 0:
             messages = messages[start_index:]
 
+        if include_reasoning:
+            items.extend(APIServerAdapter._extract_reasoning_items(messages))
+
         for msg in messages:
             role = msg.get("role")
-            if role == "assistant" and include_reasoning:
-                reasoning_text = msg.get("reasoning_content") or msg.get("reasoning")
-                if isinstance(reasoning_text, str) and reasoning_text.strip():
-                    items.append({
-                        "id": f"rs_{uuid.uuid4().hex[:24]}",
-                        "type": "reasoning",
-                        "summary": [{"type": "summary_text", "text": reasoning_text}],
-                        "status": "completed",
-                    })
             if role == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     func = tc.get("function", {})
@@ -3869,6 +3874,35 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
         return items
+
+    @staticmethod
+    def _extract_reasoning_items(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return completed Responses-style reasoning items from assistant messages."""
+        items: List[Dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            reasoning_text = msg.get("reasoning_content") or msg.get("reasoning")
+            if isinstance(reasoning_text, str) and reasoning_text.strip():
+                items.append({
+                    "id": f"rs_{uuid.uuid4().hex[:24]}",
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": reasoning_text}],
+                    "status": "completed",
+                })
+        return items
+
+    @staticmethod
+    def _trim_reasoning_item_for_terminal(item: Dict[str, Any]) -> Dict[str, Any]:
+        """Trim large reasoning summaries for terminal envelope/storage surfaces."""
+        summary = item.get("summary", [])
+        if isinstance(summary, list) and summary:
+            first = summary[0]
+            if isinstance(first, dict):
+                text = first.get("text", "")
+                if len(text) > 1000:
+                    first["text"] = text[:500] + "...[" + str(len(text) - 500) + " more chars]"
+        return item
 
     # ------------------------------------------------------------------
     # Agent execution

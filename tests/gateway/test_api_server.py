@@ -3875,7 +3875,7 @@ class TestResponsesReasoningItems:
 
     @pytest.mark.asyncio
     async def test_stream_reasoning_trimmed_in_completed_envelope(self, adapter):
-        """Live events carry full text; the terminal envelope is trimmed like tool args."""
+        """Terminal reasoning items stay consistent across stream done/event/store."""
         long_text = "R" * 2000
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -3897,6 +3897,12 @@ class TestResponsesReasoningItems:
             deltas = [d for n, d in events if n == "response.reasoning_summary_text.delta"]
             assert any(d.get("delta") == long_text for d in deltas)
 
+            done_items = [
+                d["item"] for n, d in events
+                if n == "response.output_item.done" and d.get("item", {}).get("type") == "reasoning"
+            ]
+            assert len(done_items) == 1
+
             completed = [d for n, d in events if n == "response.completed"][0]
             reasoning_items = [
                 it for it in completed["response"]["output"] if it.get("type") == "reasoning"
@@ -3905,6 +3911,62 @@ class TestResponsesReasoningItems:
             envelope_text = reasoning_items[0]["summary"][0]["text"]
             assert len(envelope_text) < 700
             assert "more chars" in envelope_text
+            assert done_items[0]["summary"][0]["text"] == envelope_text
+
+            stored = adapter._response_store.get(completed["response"]["id"])
+            assert stored is not None
+            stored_reasoning = [
+                it for it in stored["response"]["output"] if it.get("type") == "reasoning"
+            ]
+            assert len(stored_reasoning) == 1
+            assert stored_reasoning[0]["summary"][0]["text"] == envelope_text
+
+    @pytest.mark.asyncio
+    async def test_stream_falls_back_to_final_reasoning_when_callback_is_silent(self, adapter):
+        """If the provider only reports reasoning in final messages, stream mode still includes it."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                text_cb = kwargs.get("stream_delta_callback")
+                if text_cb:
+                    text_cb("Done.")
+                return (
+                    {
+                        "final_response": "Done.",
+                        "messages": [
+                            {"role": "user", "content": "hi"},
+                            {"role": "assistant", "content": "Done.", "reasoning_content": "thought about it"},
+                        ],
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_reasoning_items_enabled", return_value=True),
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+            events = _parse_sse_events(body)
+            completed = [d for n, d in events if n == "response.completed"]
+            assert len(completed) == 1
+            output = completed[0]["response"]["output"]
+            reasoning_items = [it for it in output if it.get("type") == "reasoning"]
+            assert len(reasoning_items) == 1
+            assert reasoning_items[0]["summary"][0]["text"] == "thought about it"
+
+            stored = adapter._response_store.get(completed[0]["response"]["id"])
+            assert stored is not None
+            stored_reasoning = [
+                it for it in stored["response"]["output"] if it.get("type") == "reasoning"
+            ]
+            assert len(stored_reasoning) == 1
 
     @pytest.mark.asyncio
     async def test_input_ignores_echoed_reasoning_items(self, adapter):
