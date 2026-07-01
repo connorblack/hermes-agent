@@ -68,6 +68,7 @@ class ToolSearchConfig:
     threshold_pct: float  # 0..100 — only used when enabled == "auto"
     search_default_limit: int
     max_search_limit: int
+    always_visible: frozenset[str] = field(default_factory=frozenset)
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -105,12 +106,25 @@ class ToolSearchConfig:
         max_search_limit = max(1, min(50, _safe_int(raw.get("max_search_limit"), 20)))
         search_default_limit = max(1, min(max_search_limit,
                                           _safe_int(raw.get("search_default_limit"), 5)))
+        always_visible_raw = raw.get("always_visible", [])
+        if isinstance(always_visible_raw, str):
+            always_visible_items = [always_visible_raw]
+        elif isinstance(always_visible_raw, (list, tuple, set)):
+            always_visible_items = list(always_visible_raw)
+        else:
+            always_visible_items = []
+        always_visible = frozenset(
+            str(name).strip()
+            for name in always_visible_items
+            if str(name).strip()
+        )
 
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
             search_default_limit=search_default_limit,
             max_search_limit=max_search_limit,
+            always_visible=always_visible,
         )
 
 
@@ -552,6 +566,18 @@ def assemble_tool_defs(
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
     visible, deferrable = classify_tools(incoming)
+    if config.always_visible and deferrable:
+        pinned: List[Dict[str, Any]] = []
+        still_deferrable: List[Dict[str, Any]] = []
+        for td in deferrable:
+            name = (td.get("function") or {}).get("name", "")
+            if name in config.always_visible:
+                pinned.append(td)
+            else:
+                still_deferrable.append(td)
+        if pinned:
+            visible.extend(pinned)
+            deferrable = still_deferrable
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 

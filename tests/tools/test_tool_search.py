@@ -82,6 +82,16 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_always_visible_list_parsed(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw({
+            "always_visible": ["mcp_hindsight_journal_list_tags", "", 123],
+        })
+        assert cfg.always_visible == frozenset({
+            "mcp_hindsight_journal_list_tags",
+            "123",
+        })
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -277,6 +287,47 @@ class TestAssembly:
         # The pre-existing tool_search was stripped (it would be re-injected if
         # activation happened; here it didn't).
         assert "tool_search" not in names
+
+    def test_always_visible_deferrable_tool_survives_activation(self):
+        """Configured tools can stay direct-visible while the rest defer."""
+        from tools.registry import registry
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+
+        def _handler(args, task_id=None, **kw):
+            return json.dumps({"ok": True})
+
+        registry.register(
+            name="mcp_visible_pin",
+            handler=_handler,
+            schema=_td("mcp_visible_pin", "pinned MCP tool"),
+            toolset="mcp-visible-pin",
+        )
+        registry.register(
+            name="mcp_visible_deferred",
+            handler=_handler,
+            schema=_td("mcp_visible_deferred", "deferred MCP tool"),
+            toolset="mcp-visible-pin",
+        )
+
+        result = assemble_tool_defs(
+            [
+                _td("terminal", "Run shell"),
+                _td("mcp_visible_pin", "pinned MCP tool"),
+                _td("mcp_visible_deferred", "deferred MCP tool"),
+            ],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({
+                "enabled": "on",
+                "always_visible": ["mcp_visible_pin"],
+            }),
+        )
+
+        names = {t["function"]["name"] for t in result.tool_defs}
+        assert result.activated
+        assert "terminal" in names
+        assert "mcp_visible_pin" in names
+        assert "mcp_visible_deferred" not in names
+        assert {"tool_search", "tool_describe", "tool_call"} <= names
 
 
 # ---------------------------------------------------------------------------
@@ -535,4 +586,3 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-
