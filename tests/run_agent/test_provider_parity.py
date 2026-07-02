@@ -19,7 +19,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 from run_agent import AIAgent
-from agent.conversation_loop import _recover_leaked_journal_tool_call
+from agent.conversation_loop import _coerce_journal_tool_calls, _recover_leaked_journal_tool_call
 from agent.transports.codex import ResponsesApiTransport
 
 
@@ -186,6 +186,62 @@ def test_recovers_raw_hindsight_journal_tool_bait_as_wrapper():
     args = json.loads(msg.tool_calls[0].function.arguments)
     assert args["query"].startswith("Use mcp_hindsight_journal_recall")
     assert args["date"] == "2022-03-03"
+
+
+def test_recovers_concatenated_json_journal_tool_call_leaks():
+    msg = SimpleNamespace(
+        content=(
+            json.dumps(
+                {
+                    "name": "mcp_journal_search_journal_search",
+                    "arguments": {"query": "themes", "month": "1999-01"},
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "name": "mcp_journal_search_journal_search",
+                    "arguments": {"query": "themes", "month": "1999-02"},
+                }
+            )
+            + "\nFinal answer text that must not bypass tools."
+        ),
+        tool_calls=None,
+    )
+
+    assert _recover_leaked_journal_tool_call(
+        msg,
+        "Compare Ken's journal themes in January 1999 versus February 1999.",
+    )
+    assert len(msg.tool_calls) == 2
+    first = json.loads(msg.tool_calls[0].function.arguments)
+    second = json.loads(msg.tool_calls[1].function.arguments)
+    assert first["month"] == "1999-01"
+    assert second["month"] == "1999-02"
+    assert first["intent"] == "compare"
+
+
+def test_coerces_under_specified_journal_tool_call_from_media_prompt():
+    msg = SimpleNamespace(
+        content=None,
+        tool_calls=[
+            SimpleNamespace(
+                function=SimpleNamespace(
+                    name="mcp_journal_search_journal_search",
+                    arguments=json.dumps({"query": "", "date": "1995-09-16"}),
+                )
+            )
+        ],
+    )
+
+    assert _coerce_journal_tool_calls(
+        msg,
+        "Find the source entry and image for September 16, 1995.",
+    )
+    args = json.loads(msg.tool_calls[0].function.arguments)
+    assert args["query"].startswith("Find the source entry")
+    assert args["date"] == "1995-09-16"
+    assert args["media"] == "include"
 
 
 # ── _build_api_kwargs tests ─────────────────────────────────────────────────

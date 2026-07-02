@@ -142,6 +142,66 @@ def _normalize_journal_leak_args(tool_name: str, raw_args: dict[str, Any], user_
     return args
 
 
+def _journal_leaked_json_objects(text: str) -> list[dict[str, Any]]:
+    """Return JSON objects from pseudo-tool-call text, including concatenated blocks."""
+    decoder = json.JSONDecoder()
+    objects: list[dict[str, Any]] = []
+    pos = 0
+    length = len(text)
+    while pos < length:
+        while pos < length and text[pos].isspace():
+            pos += 1
+        if pos >= length:
+            break
+        if text[pos] != "{":
+            next_obj = text.find("{", pos + 1)
+            if next_obj < 0:
+                break
+            pos = next_obj
+            continue
+        try:
+            value, end = decoder.raw_decode(text, pos)
+        except json.JSONDecodeError:
+            pos += 1
+            continue
+        if isinstance(value, dict):
+            objects.append(value)
+        pos = max(end, pos + 1)
+    return objects
+
+
+def _coerce_journal_tool_calls(assistant_message: Any, user_message: str) -> bool:
+    """Normalize existing journal-search tool calls before execution."""
+    tool_calls = getattr(assistant_message, "tool_calls", None) or []
+    changed = False
+    for tc in tool_calls:
+        function = getattr(tc, "function", None)
+        tool_name = getattr(function, "name", None)
+        if not isinstance(tool_name, str):
+            continue
+        if tool_name != _JOURNAL_SEARCH_TOOL_NAME and not tool_name.startswith(_RAW_HINDSIGHT_JOURNAL_PREFIX):
+            continue
+        raw_arguments = getattr(function, "arguments", "{}")
+        if isinstance(raw_arguments, str):
+            try:
+                raw_args = json.loads(raw_arguments) if raw_arguments.strip() else {}
+            except json.JSONDecodeError:
+                raw_args = {}
+        elif isinstance(raw_arguments, dict):
+            raw_args = raw_arguments
+        else:
+            raw_args = {}
+        args = _normalize_journal_leak_args(tool_name, raw_args, user_message)
+        if args is None:
+            continue
+        normalized = json.dumps(args, ensure_ascii=False)
+        if tool_name != _JOURNAL_SEARCH_TOOL_NAME or raw_arguments != normalized:
+            function.name = _JOURNAL_SEARCH_TOOL_NAME
+            function.arguments = normalized
+            changed = True
+    return changed
+
+
 def _recover_leaked_journal_tool_call(assistant_message: Any, user_message: str) -> bool:
     """Convert journal-search pseudo-call text into a real tool call.
 
@@ -159,47 +219,50 @@ def _recover_leaked_journal_tool_call(assistant_message: Any, user_message: str)
         return False
     stripped = text.strip()
 
-    tool_name: str | None = None
-    raw_args: dict[str, Any] = {}
+    recovered: list[tuple[str, dict[str, Any]]] = []
 
-    try:
-        parsed = json.loads(stripped)
-    except Exception:
-        parsed = None
-    if isinstance(parsed, dict):
+    for parsed in _journal_leaked_json_objects(stripped):
         candidate = parsed.get("action") or parsed.get("name") or parsed.get("tool_name")
         if isinstance(candidate, str):
-            tool_name = candidate.strip()
-            raw_args = parsed
+            recovered.append((candidate.strip(), parsed))
 
-    if tool_name is None:
+    if not recovered:
         match = _JOURNAL_LEAK_FUNCTION_RE.search(stripped)
         if match:
-            tool_name = match.group(1).strip()
             raw_args = {
                 key.strip(): value.strip()
                 for key, value in _JOURNAL_LEAK_PARAMETER_RE.findall(match.group(2) or "")
                 if key.strip()
             }
+            recovered.append((match.group(1).strip(), raw_args))
 
-    if not tool_name:
-        return False
-    args = _normalize_journal_leak_args(tool_name, raw_args, user_message)
-    if args is None:
-        return False
-
-    call_id = f"call_journal_leak_{uuid.uuid4().hex[:12]}"
-    assistant_message.tool_calls = [
-        SimpleNamespace(
-            id=call_id,
-            call_id=call_id,
-            type="function",
-            function=SimpleNamespace(
-                name=_JOURNAL_SEARCH_TOOL_NAME,
-                arguments=json.dumps(args, ensure_ascii=False),
-            ),
+    calls: list[SimpleNamespace] = []
+    seen: set[tuple[str, str]] = set()
+    for tool_name, raw_args in recovered:
+        args = _normalize_journal_leak_args(tool_name, raw_args, user_message)
+        if args is None:
+            continue
+        normalized_args = json.dumps(args, ensure_ascii=False)
+        key = (_JOURNAL_SEARCH_TOOL_NAME, normalized_args)
+        if key in seen:
+            continue
+        seen.add(key)
+        call_id = f"call_journal_leak_{uuid.uuid4().hex[:12]}"
+        calls.append(
+            SimpleNamespace(
+                id=call_id,
+                call_id=call_id,
+                type="function",
+                function=SimpleNamespace(
+                    name=_JOURNAL_SEARCH_TOOL_NAME,
+                    arguments=normalized_args,
+                ),
+            )
         )
-    ]
+    if not calls:
+        return False
+
+    assistant_message.tool_calls = calls
     assistant_message.content = ""
     return True
 
@@ -4093,6 +4156,14 @@ def run_conversation(
                 finish_reason = "tool_calls"
                 logger.warning(
                     "Recovered leaked journal-search pseudo-call text into a structured tool call "
+                    "(session=%s, model=%s)",
+                    agent.session_id or "-",
+                    agent.model,
+                )
+            elif _coerce_journal_tool_calls(assistant_message, user_message):
+                finish_reason = "tool_calls"
+                logger.info(
+                    "Normalized journal-search tool-call arguments before execution "
                     "(session=%s, model=%s)",
                     agent.session_id or "-",
                     agent.model,
