@@ -40,6 +40,7 @@ import queue
 import sys
 import threading
 
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -56,6 +57,7 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+_BANK_CONFIG_SYNC_TIMEOUT = 10  # seconds — do not let bank mission sync block startup
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -280,7 +282,11 @@ def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT):
     future = safe_schedule_threadsafe(coro, loop)
     if future is None:
         raise RuntimeError("Hindsight loop unavailable")
-    return future.result(timeout=timeout)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeoutError:
+        future.cancel()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1065,9 +1071,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._client = Hindsight(**kwargs)
         return self._client
 
-    def _run_sync(self, coro):
+    def _run_sync(self, coro, *, timeout: float | None = None):
         """Schedule *coro* on the shared loop using the configured timeout."""
-        return _run_sync(coro, timeout=self._timeout)
+        return _run_sync(coro, timeout=self._timeout if timeout is None else timeout)
 
     def _is_retriable_embedded_connection_error(self, exc: Exception) -> bool:
         """Return True for stale embedded-daemon connection failures."""
@@ -1151,13 +1157,19 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
-    def _run_hindsight_operation(self, operation, *, sync_bank_config: bool = True):
+    def _run_hindsight_operation(
+        self,
+        operation,
+        *,
+        sync_bank_config: bool = True,
+        timeout: float | None = None,
+    ):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
         if sync_bank_config and not self._bank_config_sync_complete:
             self._sync_bank_config_if_configured()
         client = self._get_client()
         try:
-            return self._run_sync(operation(client))
+            return self._run_sync(operation(client), timeout=timeout)
         except Exception as exc:
             if not self._is_retriable_embedded_connection_error(exc):
                 raise
@@ -1168,7 +1180,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = None
             client = self._get_client()
             self._client = client
-            return self._run_sync(operation(client))
+            return self._run_sync(operation(client), timeout=timeout)
 
     def _sync_bank_config_if_configured(self) -> None:
         """Apply configured bank missions to Hindsight once per process.
@@ -1198,6 +1210,7 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         with _bank_config_sync_lock:
             if cache_key in _bank_config_sync_cache:
+                self._bank_config_sync_complete = True
                 return
 
         async def _update(client):
@@ -1206,7 +1219,11 @@ class HindsightMemoryProvider(MemoryProvider):
             return client.update_bank_config(self._bank_id, **updates)
 
         try:
-            self._run_hindsight_operation(_update, sync_bank_config=False)
+            self._run_hindsight_operation(
+                _update,
+                sync_bank_config=False,
+                timeout=min(float(self._timeout or _DEFAULT_TIMEOUT), _BANK_CONFIG_SYNC_TIMEOUT),
+            )
         except Exception as exc:
             logger.warning(
                 "Hindsight bank config sync failed: %s",

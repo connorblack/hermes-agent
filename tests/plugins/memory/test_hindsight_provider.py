@@ -17,6 +17,8 @@ import pytest
 
 from hermes_cli.memory_setup import _CANCELLED
 from plugins.memory.hindsight import (
+    _BANK_CONFIG_SYNC_TIMEOUT,
+    _bank_config_sync_cache,
     HindsightMemoryProvider,
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
@@ -38,6 +40,7 @@ from plugins.memory.hindsight import (
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Ensure no stale env vars leak between tests."""
+    _bank_config_sync_cache.clear()
     for key in (
         "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID",
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
@@ -413,6 +416,36 @@ class TestConfig:
 
         assert "Memory 1" in result["result"]
         assert p._client._aupdate_bank_config.await_count == 2
+
+    def test_bank_mission_sync_is_bounded_and_best_effort(self, provider_with_config):
+        p = provider_with_config(
+            timeout=300,
+            bank_mission="Reflect only on durable operator preferences and system state.",
+            bank_retain_mission="Extract durable operator preferences, configuration decisions, incidents, and fixes.",
+        )
+        p._run_hindsight_operation = MagicMock(side_effect=TimeoutError("slow sync"))
+
+        p._sync_bank_config_if_configured()
+
+        p._run_hindsight_operation.assert_called_once()
+        assert p._run_hindsight_operation.call_args.kwargs["sync_bank_config"] is False
+        assert p._run_hindsight_operation.call_args.kwargs["timeout"] == _BANK_CONFIG_SYNC_TIMEOUT
+        assert p._bank_config_sync_complete is False
+
+    def test_bank_mission_sync_cache_hit_marks_provider_complete(self, provider_with_config):
+        reflect_mission = "Reflect only on durable operator preferences and system state."
+        retain_mission = "Extract durable operator preferences, configuration decisions, incidents, and fixes."
+        p = provider_with_config(
+            bank_mission=reflect_mission,
+            bank_retain_mission=retain_mission,
+        )
+        p._bank_config_sync_complete = False
+        _bank_config_sync_cache.add((p._api_url, p._bank_id, reflect_mission, retain_mission))
+
+        p._sync_bank_config_if_configured()
+
+        assert p._bank_config_sync_complete is True
+        p._client._aupdate_bank_config.assert_not_awaited()
 
     def test_config_from_env_fallback(self, tmp_path, monkeypatch):
         """When no config file exists, falls back to env vars."""
