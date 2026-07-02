@@ -591,8 +591,15 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
     forced_tool_choice = getattr(agent, "_forced_tool_choice", None)
-    if forced_tool_choice is not None:
+
+    def _claim_forced_tool_choice() -> str | None:
+        nonlocal forced_tool_choice
+        if forced_tool_choice is None or not tools_for_api:
+            return None
         agent._forced_tool_choice = None
+        claimed = forced_tool_choice
+        forced_tool_choice = None
+        return claimed
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -683,7 +690,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
-            forced_tool_choice=forced_tool_choice,
+            forced_tool_choice=_claim_forced_tool_choice(),
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
             max_tokens=agent.max_tokens,
@@ -790,7 +797,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             max_tokens=agent.max_tokens,
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
-            forced_tool_choice=forced_tool_choice,
+            forced_tool_choice=_claim_forced_tool_choice(),
             reasoning_config=agent.reasoning_config,
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
@@ -823,7 +830,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         max_tokens=agent.max_tokens,
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
-        forced_tool_choice=forced_tool_choice,
+        forced_tool_choice=_claim_forced_tool_choice(),
         reasoning_config=agent.reasoning_config,
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),

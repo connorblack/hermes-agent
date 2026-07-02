@@ -97,7 +97,7 @@ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 JOURNAL_SEARCH_TOOL_NAME = "mcp_journal_search_journal_search"
 _JOURNAL_SEARCH_TRIGGER_RE = re.compile(
     r"\b("
-    r"journal|journal_search|ken'?s?\s+journal|ken-gpt|hindsight|"
+    r"journal|journal_search|mcp_hindsight_journal\w*|ken'?s?\s+journal|ken-gpt|hindsight|"
     r"corpus|document\s+id|document\s+provenance|"
     r"immich|media\s+ref|ken-media://|image\s+evidence|"
     r"photo|photos|image|images"

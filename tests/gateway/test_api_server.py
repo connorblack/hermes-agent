@@ -1658,6 +1658,7 @@ class TestResponsesEndpoint:
     def test_journal_search_force_classifier(self):
         assert _should_force_journal_search("What happened in Ken's March 3, 2022 journal entry?")
         assert _should_force_journal_search("Show the Immich image evidence for 1995-09-16.")
+        assert _should_force_journal_search("Use mcp_hindsight_journal_recall with strict day:2022-03-03.")
         assert not _should_force_journal_search("What is the capital of France?")
         assert not _should_force_journal_search(
             "What do you remember about the current Hermes/OpenWebUI setup? Do not search Ken's journal."

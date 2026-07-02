@@ -106,6 +106,27 @@ def test_codex_responses_transport_honors_forced_tool_choice():
     assert kwargs["parallel_tool_calls"] is False
 
 
+def test_forced_tool_choice_waits_for_tool_capable_request(monkeypatch):
+    agent = _make_agent(monkeypatch, "custom", base_url="http://localhost:4000/v1")
+    forced_name = "mcp_journal_search_journal_search"
+    agent._forced_tool_choice = forced_name
+    agent.tools = []
+
+    without_tools = agent._build_api_kwargs([{"role": "user", "content": "Search Ken's journal."}])
+
+    assert "tool_choice" not in without_tools
+    assert agent._forced_tool_choice == forced_name
+
+    agent.tools = _tool_defs(forced_name)
+    with_tools = agent._build_api_kwargs([{"role": "user", "content": "Search Ken's journal."}])
+
+    assert with_tools["tool_choice"] == {
+        "type": "function",
+        "function": {"name": forced_name},
+    }
+    assert agent._forced_tool_choice is None
+
+
 # ── _build_api_kwargs tests ─────────────────────────────────────────────────
 
 class TestBuildApiKwargsOpenRouter:
