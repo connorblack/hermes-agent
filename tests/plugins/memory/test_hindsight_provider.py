@@ -391,15 +391,16 @@ class TestConfig:
             bank_mission="Reflect only on durable operator preferences and system state.",
             bank_retain_mission="Extract durable operator preferences, configuration decisions, incidents, and fixes. Ignore journal content unless it changes appliance behavior.",
         )
+        p._update_bank_config_over_http = MagicMock()
 
         p._sync_bank_config_if_configured()
 
-        p._client._aupdate_bank_config.assert_awaited_once_with(
-            "test-bank",
+        p._update_bank_config_over_http.assert_called_once_with(
             {
                 "reflect_mission": "Reflect only on durable operator preferences and system state.",
                 "retain_mission": "Extract durable operator preferences, configuration decisions, incidents, and fixes. Ignore journal content unless it changes appliance behavior.",
             },
+            timeout=_BANK_CONFIG_SYNC_TIMEOUT,
         )
 
     def test_bank_mission_sync_retries_after_startup_failure(self, provider_with_config):
@@ -407,15 +408,15 @@ class TestConfig:
             bank_mission="Reflect only on durable operator preferences and system state.",
             bank_retain_mission="Extract durable operator preferences, configuration decisions, incidents, and fixes.",
         )
-        p._client._aupdate_bank_config.side_effect = [RuntimeError("not ready"), {"ok": True}]
+        p._update_bank_config_over_http = MagicMock(side_effect=[RuntimeError("not ready"), None])
 
         p._sync_bank_config_if_configured()
-        assert p._client._aupdate_bank_config.await_count == 1
+        assert p._update_bank_config_over_http.call_count == 1
 
         result = json.loads(p.handle_tool_call("hindsight_recall", {"query": "test"}))
 
         assert "Memory 1" in result["result"]
-        assert p._client._aupdate_bank_config.await_count == 2
+        assert p._update_bank_config_over_http.call_count == 2
 
     def test_bank_mission_sync_is_bounded_and_best_effort(self, provider_with_config):
         p = provider_with_config(
@@ -423,13 +424,12 @@ class TestConfig:
             bank_mission="Reflect only on durable operator preferences and system state.",
             bank_retain_mission="Extract durable operator preferences, configuration decisions, incidents, and fixes.",
         )
-        p._run_hindsight_operation = MagicMock(side_effect=TimeoutError("slow sync"))
+        p._update_bank_config_over_http = MagicMock(side_effect=TimeoutError("slow sync"))
 
         p._sync_bank_config_if_configured()
 
-        p._run_hindsight_operation.assert_called_once()
-        assert p._run_hindsight_operation.call_args.kwargs["sync_bank_config"] is False
-        assert p._run_hindsight_operation.call_args.kwargs["timeout"] == _BANK_CONFIG_SYNC_TIMEOUT
+        p._update_bank_config_over_http.assert_called_once()
+        assert p._update_bank_config_over_http.call_args.kwargs["timeout"] == _BANK_CONFIG_SYNC_TIMEOUT
         assert p._bank_config_sync_complete is False
 
     def test_bank_mission_sync_cache_hit_marks_provider_complete(self, provider_with_config):

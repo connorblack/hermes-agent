@@ -39,6 +39,9 @@ import os
 import queue
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
@@ -1182,6 +1185,29 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = client
             return self._run_sync(operation(client), timeout=timeout)
 
+    def _update_bank_config_over_http(
+        self,
+        updates: dict[str, Any],
+        *,
+        timeout: float,
+    ) -> None:
+        """Update bank config through the stable HTTP API.
+
+        The Hindsight client's private async bank-config helper uses aiohttp,
+        which can hang against OpenShell's host-gateway forwarder even while
+        curl/urllib and the regular retain/recall client paths work. Keep this
+        small sync PATCH path local to the startup mission sync.
+        """
+        bank_id = urllib.parse.quote(self._bank_id, safe="")
+        url = f"{self._api_url.rstrip('/')}/v1/default/banks/{bank_id}/config"
+        payload = json.dumps({"updates": updates}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        req = urllib.request.Request(url, data=payload, method="PATCH", headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            resp.read()
+
     def _sync_bank_config_if_configured(self) -> None:
         """Apply configured bank missions to Hindsight once per process.
 
@@ -1213,16 +1239,13 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._bank_config_sync_complete = True
                 return
 
-        async def _update(client):
-            if hasattr(client, "_aupdate_bank_config"):
-                return await client._aupdate_bank_config(self._bank_id, updates)
-            return client.update_bank_config(self._bank_id, **updates)
-
         try:
-            self._run_hindsight_operation(
-                _update,
-                sync_bank_config=False,
-                timeout=min(float(self._timeout or _DEFAULT_TIMEOUT), _BANK_CONFIG_SYNC_TIMEOUT),
+            self._update_bank_config_over_http(
+                updates,
+                timeout=min(
+                    float(self._timeout or _DEFAULT_TIMEOUT),
+                    _BANK_CONFIG_SYNC_TIMEOUT,
+                ),
             )
         except Exception as exc:
             logger.warning(
