@@ -19,6 +19,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 from run_agent import AIAgent
+from agent.conversation_loop import _recover_leaked_journal_tool_call
 from agent.transports.codex import ResponsesApiTransport
 
 
@@ -125,6 +126,66 @@ def test_forced_tool_choice_waits_for_tool_capable_request(monkeypatch):
         "function": {"name": forced_name},
     }
     assert agent._forced_tool_choice is None
+
+
+def test_recovers_json_journal_tool_call_leak():
+    msg = SimpleNamespace(
+        content=json.dumps(
+            {
+                "action": "mcp_journal_search_journal_search",
+                "query": "What happened in Ken's March 3, 2022 journal entry?",
+                "date": "2022-03-03",
+            }
+        ),
+        tool_calls=None,
+    )
+
+    assert _recover_leaked_journal_tool_call(msg, "What happened in Ken's March 3, 2022 journal entry?")
+    assert msg.content == ""
+    assert msg.tool_calls[0].function.name == "mcp_journal_search_journal_search"
+    args = json.loads(msg.tool_calls[0].function.arguments)
+    assert args["query"] == "What happened in Ken's March 3, 2022 journal entry?"
+    assert args["date"] == "2022-03-03"
+
+
+def test_recovers_xml_journal_tool_call_leak_with_media_hint():
+    msg = SimpleNamespace(
+        content=(
+            "<function=mcp_journal_search_journal_search>\n"
+            "<parameter=date>\n1995-09-16\n</parameter>"
+        ),
+        tool_calls=[],
+    )
+
+    assert _recover_leaked_journal_tool_call(
+        msg,
+        "Find the source entry and image for September 16, 1995.",
+    )
+    args = json.loads(msg.tool_calls[0].function.arguments)
+    assert args["date"] == "1995-09-16"
+    assert args["media"] == "include"
+    assert args["intent"] == "read"
+
+
+def test_recovers_raw_hindsight_journal_tool_bait_as_wrapper():
+    msg = SimpleNamespace(
+        content=json.dumps(
+            {
+                "action": "mcp_hindsight_journal_recall",
+                "params": {"query": "", "day": "2022-03-03"},
+            }
+        ),
+        tool_calls=None,
+    )
+
+    assert _recover_leaked_journal_tool_call(
+        msg,
+        "Use mcp_hindsight_journal_recall with strict day:2022-03-03 and answer what Ken wrote.",
+    )
+    assert msg.tool_calls[0].function.name == "mcp_journal_search_journal_search"
+    args = json.loads(msg.tool_calls[0].function.arguments)
+    assert args["query"].startswith("Use mcp_hindsight_journal_recall")
+    assert args["date"] == "2022-03-03"
 
 
 # ── _build_api_kwargs tests ─────────────────────────────────────────────────

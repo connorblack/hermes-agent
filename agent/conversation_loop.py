@@ -25,6 +25,7 @@ import ssl
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -72,6 +73,135 @@ logger = logging.getLogger(__name__)
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
+_JOURNAL_SEARCH_TOOL_NAME = "mcp_journal_search_journal_search"
+_RAW_HINDSIGHT_JOURNAL_PREFIX = "mcp_hindsight_journal_"
+_JOURNAL_LEAK_FUNCTION_RE = re.compile(
+    r"<function=([A-Za-z0-9_.:-]+)>\s*(.*?)\s*(?:</function>)?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_JOURNAL_LEAK_PARAMETER_RE = re.compile(
+    r"<parameter=([A-Za-z0-9_.:-]+)>\s*(.*?)\s*</parameter>",
+    re.IGNORECASE | re.DOTALL,
+)
+_JOURNAL_MEDIA_RE = re.compile(r"\b(image|images|photo|photos|picture|thumbnail|media|immich|ken-media)\b", re.I)
+_JOURNAL_COMPARE_RE = re.compile(r"\b(compare|versus|vs\.?|difference|differences)\b", re.I)
+
+
+def _normalize_journal_leak_args(tool_name: str, raw_args: dict[str, Any], user_message: str) -> dict[str, Any] | None:
+    """Map leaked journal/raw-Hindsight pseudo calls onto the wrapper schema."""
+    if tool_name != _JOURNAL_SEARCH_TOOL_NAME and not tool_name.startswith(_RAW_HINDSIGHT_JOURNAL_PREFIX):
+        return None
+
+    args: dict[str, Any] = {}
+    nested = raw_args.get("params")
+    if not isinstance(nested, dict):
+        nested = raw_args.get("arguments")
+    if isinstance(nested, dict):
+        raw_args = {**raw_args, **nested}
+
+    query = raw_args.get("query") or raw_args.get("question") or raw_args.get("q")
+    if not isinstance(query, str) or not query.strip():
+        query = user_message or "Ken journal search"
+    args["query"] = query.strip()
+
+    for source_key, target_key in (
+        ("date", "date"),
+        ("day", "date"),
+        ("week", "week"),
+        ("month", "month"),
+        ("year", "year"),
+        ("date_from", "date_from"),
+        ("date_to", "date_to"),
+    ):
+        value = raw_args.get(source_key)
+        if isinstance(value, str) and value.strip():
+            args[target_key] = value.strip().removeprefix("day:")
+
+    media = raw_args.get("media")
+    if media in {"auto", "include", "none"}:
+        args["media"] = media
+    elif _JOURNAL_MEDIA_RE.search(user_message or ""):
+        args["media"] = "include"
+
+    intent = raw_args.get("intent")
+    if intent in {"answer", "evidence", "read", "inventory", "compare"}:
+        args["intent"] = intent
+    elif _JOURNAL_COMPARE_RE.search(user_message or ""):
+        args["intent"] = "compare"
+    elif args.get("date"):
+        args["intent"] = "read"
+
+    depth = raw_args.get("depth")
+    if depth in {"fast", "standard", "deep"}:
+        args["depth"] = depth
+
+    options = raw_args.get("options")
+    if isinstance(options, dict):
+        args["options"] = options
+
+    return args
+
+
+def _recover_leaked_journal_tool_call(assistant_message: Any, user_message: str) -> bool:
+    """Convert journal-search pseudo-call text into a real tool call.
+
+    Some OpenAI-compatible chat-completions backends ignore ``tool_choice`` and
+    emit the intended function call as prose, commonly either as JSON
+    (``{"action": "mcp_journal_search_journal_search", ...}``) or as
+    ``<function=...><parameter=...>`` blocks. This recovery is intentionally
+    limited to the Ken journal wrapper and the retired raw Hindsight journal
+    names, because those prompts are server-forced and must have an audit trail.
+    """
+    if getattr(assistant_message, "tool_calls", None):
+        return False
+    text = getattr(assistant_message, "content", None)
+    if not isinstance(text, str) or not text.strip():
+        return False
+    stripped = text.strip()
+
+    tool_name: str | None = None
+    raw_args: dict[str, Any] = {}
+
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        candidate = parsed.get("action") or parsed.get("name") or parsed.get("tool_name")
+        if isinstance(candidate, str):
+            tool_name = candidate.strip()
+            raw_args = parsed
+
+    if tool_name is None:
+        match = _JOURNAL_LEAK_FUNCTION_RE.search(stripped)
+        if match:
+            tool_name = match.group(1).strip()
+            raw_args = {
+                key.strip(): value.strip()
+                for key, value in _JOURNAL_LEAK_PARAMETER_RE.findall(match.group(2) or "")
+                if key.strip()
+            }
+
+    if not tool_name:
+        return False
+    args = _normalize_journal_leak_args(tool_name, raw_args, user_message)
+    if args is None:
+        return False
+
+    call_id = f"call_journal_leak_{uuid.uuid4().hex[:12]}"
+    assistant_message.tool_calls = [
+        SimpleNamespace(
+            id=call_id,
+            call_id=call_id,
+            type="function",
+            function=SimpleNamespace(
+                name=_JOURNAL_SEARCH_TOOL_NAME,
+                arguments=json.dumps(args, ensure_ascii=False),
+            ),
+        )
+    ]
+    assistant_message.content = ""
+    return True
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -3954,6 +4084,19 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
+
+            recovered_journal_tool_call = _recover_leaked_journal_tool_call(
+                assistant_message,
+                user_message,
+            )
+            if recovered_journal_tool_call:
+                finish_reason = "tool_calls"
+                logger.warning(
+                    "Recovered leaked journal-search pseudo-call text into a structured tool call "
+                    "(session=%s, model=%s)",
+                    agent.session_id or "-",
+                    agent.model,
+                )
 
             try:
                 from hermes_cli.plugins import (
