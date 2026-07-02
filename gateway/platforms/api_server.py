@@ -1195,6 +1195,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if "journal_search" in enabled_toolsets:
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+
+                discover_mcp_tools()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to discover MCP tools before api_server agent creation: %s",
+                    exc,
+                )
 
         max_iterations = _current_max_iterations()
 
