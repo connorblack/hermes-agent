@@ -160,6 +160,8 @@ def _ensure_cloud_client_dependency() -> None:
 # gets the same answer without re-hitting /version on each initialize().
 _append_capability_cache: Dict[str, bool] = {}
 _append_capability_lock = threading.Lock()
+_bank_config_sync_cache: set[tuple[str, str, str, str]] = set()
+_bank_config_sync_lock = threading.Lock()
 
 
 def _meets_minimum_version(actual: str | None, required: str) -> bool:
@@ -1165,6 +1167,49 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = client
             return self._run_sync(operation(client))
 
+    def _sync_bank_config_if_configured(self) -> None:
+        """Apply configured bank missions to Hindsight once per process.
+
+        The provider's JSON config can carry bank-level extraction and reflect
+        guidance. Hindsight stores those settings on the bank config, not on
+        individual retain/recall calls, so sync the configured values explicitly
+        before the first memory operation.
+        """
+        reflect_mission = str(self._bank_mission or "").strip()
+        retain_mission = str(self._bank_retain_mission or "").strip()
+        if not reflect_mission and not retain_mission:
+            return
+
+        updates: dict[str, str] = {}
+        if reflect_mission:
+            updates["reflect_mission"] = reflect_mission
+        if retain_mission:
+            updates["retain_mission"] = retain_mission
+
+        cache_key = (
+            self._api_url or "",
+            self._bank_id,
+            reflect_mission,
+            retain_mission,
+        )
+        with _bank_config_sync_lock:
+            if cache_key in _bank_config_sync_cache:
+                return
+
+        async def _update(client):
+            if hasattr(client, "_aupdate_bank_config"):
+                return await client._aupdate_bank_config(self._bank_id, updates)
+            return client.update_bank_config(self._bank_id, **updates)
+
+        try:
+            self._run_hindsight_operation(_update)
+        except Exception as exc:
+            logger.warning("Hindsight bank config sync failed: %s", exc, exc_info=True)
+            return
+
+        with _bank_config_sync_lock:
+            _bank_config_sync_cache.add(cache_key)
+
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
 
@@ -1370,6 +1415,8 @@ class HindsightMemoryProvider(MemoryProvider):
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
                      self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
                      self._tags, self._recall_tags)
+
+        self._sync_bank_config_if_configured()
 
         # For local mode, start the embedded daemon in the background so it
         # doesn't block the chat. Redirect stdout/stderr to a log file to

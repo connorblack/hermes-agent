@@ -79,6 +79,7 @@ def _make_mock_client():
         return_value=SimpleNamespace(text="Synthesized answer")
     )
     client.aretain_batch = AsyncMock()
+    client._aupdate_bank_config = AsyncMock(return_value={"ok": True})
     client.aclose = AsyncMock()
     return client
 
@@ -381,6 +382,22 @@ class TestConfig:
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
+
+    def test_initialize_syncs_configured_bank_missions(self, provider_with_config):
+        p = provider_with_config(
+            bank_mission="Reflect only on durable operator preferences and system state.",
+            bank_retain_mission="Extract durable operator preferences, configuration decisions, incidents, and fixes. Ignore journal content unless it changes appliance behavior.",
+        )
+
+        p._sync_bank_config_if_configured()
+
+        p._client._aupdate_bank_config.assert_awaited_once_with(
+            "test-bank",
+            {
+                "reflect_mission": "Reflect only on durable operator preferences and system state.",
+                "retain_mission": "Extract durable operator preferences, configuration decisions, incidents, and fixes. Ignore journal content unless it changes appliance behavior.",
+            },
+        )
 
     def test_config_from_env_fallback(self, tmp_path, monkeypatch):
         """When no config file exists, falls back to env vars."""
