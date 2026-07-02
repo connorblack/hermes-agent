@@ -714,6 +714,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
         self._bank_id_template = ""
+        self._bank_config_sync_complete = False
 
     @property
     def name(self) -> str:
@@ -1150,8 +1151,10 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
-    def _run_hindsight_operation(self, operation):
+    def _run_hindsight_operation(self, operation, *, sync_bank_config: bool = True):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
+        if sync_bank_config and not self._bank_config_sync_complete:
+            self._sync_bank_config_if_configured()
         client = self._get_client()
         try:
             return self._run_sync(operation(client))
@@ -1178,6 +1181,7 @@ class HindsightMemoryProvider(MemoryProvider):
         reflect_mission = str(self._bank_mission or "").strip()
         retain_mission = str(self._bank_retain_mission or "").strip()
         if not reflect_mission and not retain_mission:
+            self._bank_config_sync_complete = True
             return
 
         updates: dict[str, str] = {}
@@ -1202,13 +1206,18 @@ class HindsightMemoryProvider(MemoryProvider):
             return client.update_bank_config(self._bank_id, **updates)
 
         try:
-            self._run_hindsight_operation(_update)
+            self._run_hindsight_operation(_update, sync_bank_config=False)
         except Exception as exc:
-            logger.warning("Hindsight bank config sync failed: %s", exc, exc_info=True)
+            logger.warning(
+                "Hindsight bank config sync failed: %s",
+                exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
             return
 
         with _bank_config_sync_lock:
             _bank_config_sync_cache.add(cache_key)
+        self._bank_config_sync_complete = True
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.

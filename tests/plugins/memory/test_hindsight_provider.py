@@ -399,6 +399,21 @@ class TestConfig:
             },
         )
 
+    def test_bank_mission_sync_retries_after_startup_failure(self, provider_with_config):
+        p = provider_with_config(
+            bank_mission="Reflect only on durable operator preferences and system state.",
+            bank_retain_mission="Extract durable operator preferences, configuration decisions, incidents, and fixes.",
+        )
+        p._client._aupdate_bank_config.side_effect = [RuntimeError("not ready"), {"ok": True}]
+
+        p._sync_bank_config_if_configured()
+        assert p._client._aupdate_bank_config.await_count == 1
+
+        result = json.loads(p.handle_tool_call("hindsight_recall", {"query": "test"}))
+
+        assert "Memory 1" in result["result"]
+        assert p._client._aupdate_bank_config.await_count == 2
+
     def test_config_from_env_fallback(self, tmp_path, monkeypatch):
         """When no config file exists, falls back to env vars."""
         monkeypatch.setattr(
