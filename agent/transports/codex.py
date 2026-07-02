@@ -246,8 +246,16 @@ class ResponsesApiTransport(ProviderTransport):
         }
         if response_tools:
             kwargs["tools"] = response_tools
-            kwargs["tool_choice"] = "auto"
-            kwargs["parallel_tool_calls"] = True
+            forced_tool_choice = params.get("forced_tool_choice")
+            if forced_tool_choice:
+                kwargs["tool_choice"] = {
+                    "type": "function",
+                    "name": str(forced_tool_choice),
+                }
+                kwargs["parallel_tool_calls"] = False
+            else:
+                kwargs["tool_choice"] = "auto"
+                kwargs["parallel_tool_calls"] = True
 
         session_id = params.get("session_id")
         # prompt_cache_key is content-addressed from the static prefix

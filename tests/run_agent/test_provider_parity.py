@@ -19,6 +19,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 from run_agent import AIAgent
+from agent.transports.codex import ResponsesApiTransport
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -87,6 +88,22 @@ def _make_agent(monkeypatch, provider, api_mode="chat_completions", base_url="ht
     api_key="test-key",
     base_url="https://openrouter.ai/api/v1",
     return AIAgent(**kwargs)
+
+
+def test_codex_responses_transport_honors_forced_tool_choice():
+    transport = ResponsesApiTransport()
+    kwargs = transport.build_kwargs(
+        model="nemotron-3-super",
+        messages=[{"role": "user", "content": "Search Ken's journal."}],
+        tools=_tool_defs("mcp_journal_search_journal_search"),
+        forced_tool_choice="mcp_journal_search_journal_search",
+    )
+
+    assert kwargs["tool_choice"] == {
+        "type": "function",
+        "name": "mcp_journal_search_journal_search",
+    }
+    assert kwargs["parallel_tool_calls"] is False
 
 
 # ── _build_api_kwargs tests ─────────────────────────────────────────────────
