@@ -94,7 +94,7 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
-JOURNAL_SEARCH_TOOL_NAME = "mcp_journal_search_journal_search"
+JOURNAL_SEARCH_TOOL_NAME = "mcp_journal_search"
 _JOURNAL_SEARCH_TRIGGER_RE = re.compile(
     r"\b("
     r"journal|journal_search|mcp_hindsight_journal\w*|ken'?s?\s+journal|ken-gpt|hindsight|"
@@ -1195,7 +1195,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
-        if "journal_search" in enabled_toolsets:
+        if "journal" in enabled_toolsets or "journal_search" in enabled_toolsets:
             try:
                 from tools.mcp_tool import discover_mcp_tools
 

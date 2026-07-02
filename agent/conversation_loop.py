@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
-_JOURNAL_SEARCH_TOOL_NAME = "mcp_journal_search_journal_search"
+_JOURNAL_SEARCH_TOOL_NAME = "mcp_journal_search"
 _RAW_HINDSIGHT_JOURNAL_PREFIX = "mcp_hindsight_journal_"
 _JOURNAL_LEAK_FUNCTION_RE = re.compile(
     r"<function=([A-Za-z0-9_.:-]+)>\s*(.*?)\s*(?:</function>)?\s*$",
@@ -207,7 +207,7 @@ def _recover_leaked_journal_tool_call(assistant_message: Any, user_message: str)
 
     Some OpenAI-compatible chat-completions backends ignore ``tool_choice`` and
     emit the intended function call as prose, commonly either as JSON
-    (``{"action": "mcp_journal_search_journal_search", ...}``) or as
+    (``{"action": "mcp_journal_search", ...}``) or as
     ``<function=...><parameter=...>`` blocks. This recovery is intentionally
     limited to the Ken journal wrapper and the retired raw Hindsight journal
     names, because those prompts are server-forced and must have an audit trail.

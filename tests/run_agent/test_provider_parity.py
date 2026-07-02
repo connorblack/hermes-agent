@@ -96,20 +96,20 @@ def test_codex_responses_transport_honors_forced_tool_choice():
     kwargs = transport.build_kwargs(
         model="nemotron-3-super",
         messages=[{"role": "user", "content": "Search Ken's journal."}],
-        tools=_tool_defs("mcp_journal_search_journal_search"),
-        forced_tool_choice="mcp_journal_search_journal_search",
+        tools=_tool_defs("mcp_journal_search"),
+        forced_tool_choice="mcp_journal_search",
     )
 
     assert kwargs["tool_choice"] == {
         "type": "function",
-        "name": "mcp_journal_search_journal_search",
+        "name": "mcp_journal_search",
     }
     assert kwargs["parallel_tool_calls"] is False
 
 
 def test_forced_tool_choice_waits_for_tool_capable_request(monkeypatch):
     agent = _make_agent(monkeypatch, "custom", base_url="http://localhost:4000/v1")
-    forced_name = "mcp_journal_search_journal_search"
+    forced_name = "mcp_journal_search"
     agent._forced_tool_choice = forced_name
     agent.tools = []
 
@@ -132,7 +132,7 @@ def test_recovers_json_journal_tool_call_leak():
     msg = SimpleNamespace(
         content=json.dumps(
             {
-                "action": "mcp_journal_search_journal_search",
+                "action": "mcp_journal_search",
                 "query": "What happened in Ken's March 3, 2022 journal entry?",
                 "date": "2022-03-03",
             }
@@ -142,7 +142,7 @@ def test_recovers_json_journal_tool_call_leak():
 
     assert _recover_leaked_journal_tool_call(msg, "What happened in Ken's March 3, 2022 journal entry?")
     assert msg.content == ""
-    assert msg.tool_calls[0].function.name == "mcp_journal_search_journal_search"
+    assert msg.tool_calls[0].function.name == "mcp_journal_search"
     args = json.loads(msg.tool_calls[0].function.arguments)
     assert args["query"] == "What happened in Ken's March 3, 2022 journal entry?"
     assert args["date"] == "2022-03-03"
@@ -151,7 +151,7 @@ def test_recovers_json_journal_tool_call_leak():
 def test_recovers_xml_journal_tool_call_leak_with_media_hint():
     msg = SimpleNamespace(
         content=(
-            "<function=mcp_journal_search_journal_search>\n"
+            "<function=mcp_journal_search>\n"
             "<parameter=date>\n1995-09-16\n</parameter>"
         ),
         tool_calls=[],
@@ -182,7 +182,7 @@ def test_recovers_raw_hindsight_journal_tool_bait_as_wrapper():
         msg,
         "Use mcp_hindsight_journal_recall with strict day:2022-03-03 and answer what Ken wrote.",
     )
-    assert msg.tool_calls[0].function.name == "mcp_journal_search_journal_search"
+    assert msg.tool_calls[0].function.name == "mcp_journal_search"
     args = json.loads(msg.tool_calls[0].function.arguments)
     assert args["query"].startswith("Use mcp_hindsight_journal_recall")
     assert args["date"] == "2022-03-03"
@@ -193,14 +193,14 @@ def test_recovers_concatenated_json_journal_tool_call_leaks():
         content=(
             json.dumps(
                 {
-                    "name": "mcp_journal_search_journal_search",
+                    "name": "mcp_journal_search",
                     "arguments": {"query": "themes", "month": "1999-01"},
                 }
             )
             + "\n"
             + json.dumps(
                 {
-                    "name": "mcp_journal_search_journal_search",
+                    "name": "mcp_journal_search",
                     "arguments": {"query": "themes", "month": "1999-02"},
                 }
             )
@@ -227,7 +227,7 @@ def test_coerces_under_specified_journal_tool_call_from_media_prompt():
         tool_calls=[
             SimpleNamespace(
                 function=SimpleNamespace(
-                    name="mcp_journal_search_journal_search",
+                    name="mcp_journal_search",
                     arguments=json.dumps({"query": "", "date": "1995-09-16"}),
                 )
             )
