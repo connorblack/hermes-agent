@@ -27,10 +27,12 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    JOURNAL_SEARCH_TOOL_NAME,
     ResponseStore,
     _IdempotencyCache,
     _derive_chat_session_id,
     _redact_api_error_text,
+    _should_force_journal_search,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -1653,6 +1655,11 @@ class TestDeriveChatSessionId:
 
 
 class TestResponsesEndpoint:
+    def test_journal_search_force_classifier(self):
+        assert _should_force_journal_search("What happened in Ken's March 3, 2022 journal entry?")
+        assert _should_force_journal_search("Show the Immich image evidence for 1995-09-16.")
+        assert not _should_force_journal_search("What is the capital of France?")
+
     @pytest.mark.asyncio
     async def test_missing_input_returns_400(self, adapter):
         app = _create_app(adapter)
@@ -1703,6 +1710,52 @@ class TestResponsesEndpoint:
             assert data["output"][0]["type"] == "message"
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
+
+    @pytest.mark.asyncio
+    async def test_journal_prompt_forces_wrapper_tool_choice(self, adapter):
+        mock_result = {
+            "final_response": "Done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "What happened in Ken's March 3, 2022 journal entry?",
+                    },
+                )
+
+            assert resp.status == 200
+            assert mock_run.call_args.kwargs["forced_tool_choice"] == JOURNAL_SEARCH_TOOL_NAME
+
+    @pytest.mark.asyncio
+    async def test_non_journal_prompt_does_not_force_tool_choice(self, adapter):
+        mock_result = {
+            "final_response": "Done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "What is the capital of France?",
+                    },
+                )
+
+            assert resp.status == 200
+            assert mock_run.call_args.kwargs["forced_tool_choice"] is None
 
     @pytest.mark.asyncio
     async def test_successful_response_with_array_input(self, adapter):

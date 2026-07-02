@@ -94,6 +94,16 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+JOURNAL_SEARCH_TOOL_NAME = "mcp_journal_search_journal_search"
+_JOURNAL_SEARCH_TRIGGER_RE = re.compile(
+    r"\b("
+    r"journal|journal_search|ken'?s?\s+journal|ken-gpt|hindsight|"
+    r"corpus|document\s+id|document\s+provenance|"
+    r"immich|media\s+ref|ken-media://|image\s+evidence|"
+    r"photo|photos|image|images"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -337,6 +347,44 @@ def _content_has_visible_payload(content: Any) -> bool:
                 if ptype in _IMAGE_PART_TYPES:
                     return True
     return False
+
+
+def _plain_text_for_routing(value: Any) -> str:
+    """Return a compact text view of a request payload for route classification."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(_plain_text_for_routing(item) for item in value)
+    if isinstance(value, dict):
+        pieces: List[str] = []
+        for key in ("text", "content", "query", "question", "input"):
+            if key in value:
+                pieces.append(_plain_text_for_routing(value.get(key)))
+        return "\n".join(piece for piece in pieces if piece)
+    try:
+        return str(value)
+    except Exception:
+        return ""
+
+
+def _should_force_journal_search(user_message: Any, instructions: Any = None) -> bool:
+    """True for API-server turns that must start with the journal-search wrapper.
+
+    This is deliberately narrow: it only affects the OpenAI-compatible API server
+    path, and only when the request text names the journal/corpus/media retrieval
+    domain. The forced tool choice is consumed after the first model call, so the
+    next iteration can summarize the tool result normally.
+    """
+    text = "\n".join(
+        part for part in (
+            _plain_text_for_routing(instructions),
+            _plain_text_for_routing(user_message),
+        )
+        if part
+    )
+    return bool(text and _JOURNAL_SEARCH_TRIGGER_RE.search(text))
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
@@ -3265,6 +3313,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                forced_tool_choice=(
+                    JOURNAL_SEARCH_TOOL_NAME
+                    if _should_force_journal_search(user_message, instructions)
+                    else None
+                ),
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
@@ -3305,6 +3358,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                forced_tool_choice=(
+                    JOURNAL_SEARCH_TOOL_NAME
+                    if _should_force_journal_search(user_message, instructions)
+                    else None
+                ),
                 gateway_session_key=gateway_session_key,
             )
 
@@ -3978,6 +4036,7 @@ class APIServerAdapter(BasePlatformAdapter):
         reasoning_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        forced_tool_choice: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4013,6 +4072,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
+                if forced_tool_choice:
+                    if forced_tool_choice in getattr(agent, "valid_tool_names", set()):
+                        agent._forced_tool_choice = forced_tool_choice
+                    else:
+                        logger.warning(
+                            "Forced tool choice %s is not available to api_server agent",
+                            forced_tool_choice,
+                        )
                 effective_task_id = session_id or str(uuid.uuid4())
                 result = agent.run_conversation(
                     user_message=user_message,
