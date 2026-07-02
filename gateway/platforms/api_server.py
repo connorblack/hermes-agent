@@ -104,6 +104,18 @@ _JOURNAL_SEARCH_TRIGGER_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_JOURNAL_SEARCH_NEGATION_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|avoid|skip|without)\b[^.\n]{0,80}"
+    r"\b(?:journal|journal_search|hindsight)\b",
+    re.IGNORECASE,
+)
+_JOURNAL_SEARCH_POSITIVE_ACTION_RE = re.compile(
+    r"\b(?:use|call|search|find|show|retrieve|look\s+up|cite|summarize|"
+    r"compare|source|render)\b|"
+    r"\b(?:what\s+happened|what\s+did|image\s+evidence|media\s+ref|"
+    r"document\s+id|source-grounded)\b",
+    re.IGNORECASE,
+)
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -377,13 +389,13 @@ def _should_force_journal_search(user_message: Any, instructions: Any = None) ->
     domain. The forced tool choice is consumed after the first model call, so the
     next iteration can summarize the tool result normally.
     """
-    text = "\n".join(
-        part for part in (
-            _plain_text_for_routing(instructions),
-            _plain_text_for_routing(user_message),
-        )
-        if part
-    )
+    text = _plain_text_for_routing(user_message)
+    if not text:
+        text = _plain_text_for_routing(instructions)
+    if _JOURNAL_SEARCH_NEGATION_RE.search(text):
+        text_without_negation = _JOURNAL_SEARCH_NEGATION_RE.sub("", text)
+        if not _JOURNAL_SEARCH_POSITIVE_ACTION_RE.search(text_without_negation):
+            return False
     return bool(text and _JOURNAL_SEARCH_TRIGGER_RE.search(text))
 
 

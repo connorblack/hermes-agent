@@ -1659,6 +1659,13 @@ class TestResponsesEndpoint:
         assert _should_force_journal_search("What happened in Ken's March 3, 2022 journal entry?")
         assert _should_force_journal_search("Show the Immich image evidence for 1995-09-16.")
         assert not _should_force_journal_search("What is the capital of France?")
+        assert not _should_force_journal_search(
+            "What do you remember about the current Hermes/OpenWebUI setup? Do not search Ken's journal."
+        )
+        assert not _should_force_journal_search(
+            "What is the capital of France?",
+            instructions="Use journal_search for Ken journal and Immich media questions.",
+        )
 
     @pytest.mark.asyncio
     async def test_missing_input_returns_400(self, adapter):
