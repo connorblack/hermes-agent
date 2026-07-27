@@ -4629,6 +4629,52 @@ class TestRunConversation:
             if roles[i] == "assistant" and roles[i + 1] == "assistant":
                 raise AssertionError("Consecutive assistant messages found in history")
 
+    def test_dspark_reasoning_prefill_survives_wire_sanitizers(self, agent):
+        """The DSpark recovery turn reaches vLLM as an unfinished assistant."""
+        self._setup_agent(agent)
+        agent.provider = "custom"
+        agent.model = "deepseek-v4-flash-dspark"
+        agent.base_url = "http://127.0.0.1:4000/v1"
+        agent._base_url_lower = agent.base_url.lower()
+
+        reasoning_only = _mock_response(
+            content=None,
+            finish_reason="stop",
+            reasoning_content="The final answer is ready.",
+        )
+        visible_answer = _mock_response(
+            content="Here is the visible answer.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            reasoning_only,
+            visible_answer,
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+
+        assert result["final_response"] == "Here is the visible answer."
+        assert result["api_calls"] == 2
+        continuation = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert continuation["messages"][-1] == {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "The final answer is ready.",
+        }
+        assert continuation["extra_body"] == {
+            "add_generation_prompt": False,
+            "continue_final_message": True,
+            "chat_template_kwargs": {
+                "thinking": False,
+                "enable_thinking": False,
+            },
+        }
+
     def test_truly_empty_response_retries_3_times_then_empty(self, agent):
         """Truly empty response (no content, no reasoning) retries 3 times then falls through to (empty)."""
         self._setup_agent(agent)

@@ -1372,6 +1372,30 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        # Most providers reject a final assistant message containing only
+        # reasoning, so the per-call sanitizer drops it. A provider profile
+        # can opt a specific model into its native unfinished-assistant
+        # contract. Keep the internal marker only through that sanitizer;
+        # ChatCompletionsTransport consumes it as request metadata and strips
+        # it before the messages are serialized.
+        _native_thinking_prefill = False
+        if (
+            agent.api_mode == "chat_completions"
+            and messages
+            and isinstance(messages[-1], dict)
+            and messages[-1].get("_thinking_prefill")
+        ):
+            try:
+                from providers import get_provider_profile
+
+                _prefill_profile = get_provider_profile(agent.provider)
+                _native_thinking_prefill = bool(
+                    _prefill_profile
+                    and _prefill_profile.supports_native_thinking_prefill(agent.model)
+                )
+            except Exception:
+                _native_thinking_prefill = False
+
         api_messages = []
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
@@ -1440,8 +1464,10 @@ def run_conversation(
             # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
             if "finish_reason" in api_msg:
                 api_msg.pop("finish_reason")
-            # Strip internal thinking-prefill marker
-            api_msg.pop("_thinking_prefill", None)
+            # Preserve the final marker only for an explicitly supported
+            # provider-native prefill. The transport consumes and removes it.
+            if not (_native_thinking_prefill and idx == len(messages) - 1):
+                api_msg.pop("_thinking_prefill", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields

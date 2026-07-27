@@ -203,6 +203,21 @@ class TestDropThinkingOnlyAndMergeUsers:
         out = AIAgent._drop_thinking_only_and_merge_users(msgs)
         assert [m["role"] for m in out] == ["user", "assistant", "user"]
 
+    def test_preserves_marked_prefill_for_provider_native_continuation(self):
+        msgs = [
+            {"role": "user", "content": "answer me"},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "The answer is ready.",
+                "_thinking_prefill": True,
+            },
+        ]
+
+        out = AIAgent._drop_thinking_only_and_merge_users(msgs)
+
+        assert out is msgs
+
     def test_multiple_thinking_only_in_sequence_collapses(self):
         msgs = [
             {"role": "user", "content": "u1"},
