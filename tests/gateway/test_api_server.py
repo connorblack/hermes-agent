@@ -29,8 +29,10 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    MAX_RESPONSES_SSE_FIELD_JSON_BYTES,
     ResponseStore,
     _IdempotencyCache,
+    _bound_responses_sse_text,
     _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
@@ -81,6 +83,19 @@ class TestRedactApiErrorText:
 
     def test_clean_text_passes_through_unchanged(self):
         assert _redact_api_error_text("Job not found") == "Job not found"
+
+
+class TestBoundResponsesSseText:
+    def test_short_text_is_unchanged(self):
+        assert _bound_responses_sse_text("small payload") == "small payload"
+
+    def test_large_unicode_text_is_json_byte_bounded(self):
+        original = "💥" * 100_000
+        bounded = _bound_responses_sse_text(original)
+
+        assert len(json.dumps(bounded).encode("utf-8")) <= MAX_RESPONSES_SSE_FIELD_JSON_BYTES
+        assert "truncated for SSE transport" in bounded
+        assert bounded != original
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +759,46 @@ class TestAgentExecution:
             conversation_history=[],
             task_id="session-123",
         )
+
+    @pytest.mark.asyncio
+    async def test_run_agent_closes_request_scoped_memory_clients(self, adapter):
+        memory_manager = MagicMock()
+        mock_agent = MagicMock()
+        mock_agent._memory_manager = memory_manager
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-123",
+            )
+
+        memory_manager.shutdown_all.assert_called_once_with()
+        assert mock_agent._memory_manager is None
+
+    @pytest.mark.asyncio
+    async def test_run_agent_closes_memory_clients_after_agent_failure(self, adapter):
+        memory_manager = MagicMock()
+        mock_agent = MagicMock()
+        mock_agent._memory_manager = memory_manager
+        mock_agent.run_conversation.side_effect = RuntimeError("provider failed")
+
+        with (
+            patch.object(adapter, "_create_agent", return_value=mock_agent),
+            pytest.raises(RuntimeError, match="provider failed"),
+        ):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-123",
+            )
+
+        memory_manager.shutdown_all.assert_called_once_with()
+        assert mock_agent._memory_manager is None
 
     def test_create_agent_honors_request_model_provider_and_options(self, adapter, monkeypatch):
         import gateway.run as gateway_run
