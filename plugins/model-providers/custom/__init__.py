@@ -11,7 +11,8 @@ Volcengine ARK, vLLM, llama.cpp). Key quirks:
     (the native OpenAI-compatible format GLM/ARK expect; unset omits it
     so the endpoint's server default applies)
   - DeepSeek V4 Flash DSpark reasoning-only recovery → vLLM's unfinished
-    assistant continuation fields, only for the marked recovery request
+    assistant continuation fields plus a visible-answer channel transition,
+    only for the marked recovery request
 """
 
 from typing import Any
@@ -53,11 +54,18 @@ class CustomProfile(ProviderProfile):
         # completed turn appends EOS and simply repeats the original request.
         # These are vLLM ChatCompletionRequest fields. The OpenAI SDK carries
         # them via extra_body, which serializes them as top-level JSON fields.
-        # Keep the behavior model-gated: other custom endpoints (including
-        # Ollama and llama.cpp) have different continuation contracts.
+        # The recovery's purpose is to turn already-produced reasoning into a
+        # visible answer, so disable thinking in the chat template for this
+        # continuation only. Normal DSpark requests retain the server's
+        # thinking-on default. Keep the behavior model-gated: other custom
+        # endpoints (including Ollama and llama.cpp) have different contracts.
         if thinking_prefill and _is_dspark_vllm_model(model):
             extra_body["add_generation_prompt"] = False
             extra_body["continue_final_message"] = True
+            extra_body["chat_template_kwargs"] = {
+                "thinking": False,
+                "enable_thinking": False,
+            }
 
         # Reasoning / thinking control for custom OpenAI-compatible endpoints
         # (GLM-5.2 on Volcengine ARK, vLLM, Ollama, llama.cpp, …).

@@ -223,6 +223,10 @@ class TestChatCompletionsBasic:
 
         assert kwargs["extra_body"]["add_generation_prompt"] is False
         assert kwargs["extra_body"]["continue_final_message"] is True
+        assert kwargs["extra_body"]["chat_template_kwargs"] == {
+            "thinking": False,
+            "enable_thinking": False,
+        }
         assert kwargs["messages"][-1]["reasoning_content"] == "The answer is ready."
         assert "_thinking_prefill" not in kwargs["messages"][-1]
         assert messages[-1]["_thinking_prefill"] is True
@@ -257,6 +261,7 @@ class TestChatCompletionsBasic:
         extra_body = kwargs.get("extra_body", {})
         assert "add_generation_prompt" not in extra_body
         assert "continue_final_message" not in extra_body
+        assert "chat_template_kwargs" not in extra_body
 
     def test_convert_messages_clean_list_is_identity(self, transport):
         """A list with no internal/codex keys is returned as-is (no copy)."""
