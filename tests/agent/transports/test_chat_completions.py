@@ -201,6 +201,63 @@ class TestChatCompletionsBasic:
         # Original list untouched (deepcopy-on-demand)
         assert msgs[1]["_empty_recovery_synthetic"] is True
 
+    def test_dspark_thinking_prefill_uses_vllm_continuation_contract(self, transport):
+        from providers import get_provider_profile
+
+        messages = [
+            {"role": "user", "content": "Answer briefly."},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "The answer is ready.",
+                "_thinking_prefill": True,
+            },
+        ]
+
+        kwargs = transport.build_kwargs(
+            model="deepseek-v4-flash-dspark",
+            messages=messages,
+            provider_profile=get_provider_profile("custom"),
+            base_url="http://127.0.0.1:4000/v1",
+        )
+
+        assert kwargs["extra_body"]["add_generation_prompt"] is False
+        assert kwargs["extra_body"]["continue_final_message"] is True
+        assert kwargs["messages"][-1]["reasoning_content"] == "The answer is ready."
+        assert "_thinking_prefill" not in kwargs["messages"][-1]
+        assert messages[-1]["_thinking_prefill"] is True
+
+    @pytest.mark.parametrize(
+        ("model", "thinking_prefill"),
+        [
+            ("deepseek-v4-flash-dspark", False),
+            ("other-thinking-model", True),
+        ],
+    )
+    def test_vllm_continuation_fields_are_not_sent_for_other_requests(
+        self, transport, model, thinking_prefill
+    ):
+        from providers import get_provider_profile
+
+        final_message = {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "unfinished",
+        }
+        if thinking_prefill:
+            final_message["_thinking_prefill"] = True
+
+        kwargs = transport.build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}, final_message],
+            provider_profile=get_provider_profile("custom"),
+            base_url="http://127.0.0.1:4000/v1",
+        )
+
+        extra_body = kwargs.get("extra_body", {})
+        assert "add_generation_prompt" not in extra_body
+        assert "continue_final_message" not in extra_body
+
     def test_convert_messages_clean_list_is_identity(self, transport):
         """A list with no internal/codex keys is returned as-is (no copy)."""
         msgs = [

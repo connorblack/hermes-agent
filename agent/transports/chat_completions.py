@@ -328,6 +328,15 @@ class ChatCompletionsTransport(ProviderTransport):
             anthropic_max_output: int | None
             extra_body_additions: dict | None
         """
+        # Capture the internal marker before convert_messages() removes it.
+        # Provider profiles can use this to opt into their native unfinished-
+        # assistant continuation contract without leaking the marker itself.
+        params["thinking_prefill"] = bool(
+            messages
+            and isinstance(messages[-1], dict)
+            and messages[-1].get("_thinking_prefill")
+        )
+
         # Codex sanitization: drop reasoning_items / call_id / response_item_id.
         # Pass model so the Gemini thought_signature (extra_content) is kept for
         # Gemini targets and stripped for strict non-Gemini providers.
@@ -590,6 +599,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 base_url=params.get("base_url"),
                 ollama_num_ctx=params.get("ollama_num_ctx"),
                 session_id=params.get("session_id"),
+                thinking_prefill=params.get("thinking_prefill", False),
             )
         )
         api_kwargs.update(top_level_from_profile)

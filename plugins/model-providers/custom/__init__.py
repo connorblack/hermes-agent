@@ -10,12 +10,20 @@ Volcengine ARK, vLLM, llama.cpp). Key quirks:
   - reasoning_config enabled + effort → top-level reasoning_effort
     (the native OpenAI-compatible format GLM/ARK expect; unset omits it
     so the endpoint's server default applies)
+  - DeepSeek V4 Flash DSpark reasoning-only recovery → vLLM's unfinished
+    assistant continuation fields, only for the marked recovery request
 """
 
 from typing import Any
 
 from providers import register_provider
 from providers.base import ProviderProfile
+
+
+def _is_dspark_vllm_model(model: str | None) -> bool:
+    """Return whether *model* uses the DeepSeek V4 DSpark vLLM tokenizer."""
+    normalized = (model or "").strip().lower().replace("_", "-")
+    return "deepseek-v4-flash-dspark" in normalized
 
 
 class CustomProfile(ProviderProfile):
@@ -26,6 +34,8 @@ class CustomProfile(ProviderProfile):
         *,
         reasoning_config: dict | None = None,
         ollama_num_ctx: int | None = None,
+        thinking_prefill: bool = False,
+        model: str | None = None,
         **ctx: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
@@ -36,6 +46,18 @@ class CustomProfile(ProviderProfile):
             options = extra_body.get("options", {})
             options["num_ctx"] = ollama_num_ctx
             extra_body["options"] = options
+
+        # Hermes marks a reasoning-only recovery message as an unfinished
+        # assistant prefill. DeepSeek V4 DSpark's vLLM chat template must be
+        # told to continue that final assistant turn; replaying it as a
+        # completed turn appends EOS and simply repeats the original request.
+        # These are vLLM ChatCompletionRequest fields. The OpenAI SDK carries
+        # them via extra_body, which serializes them as top-level JSON fields.
+        # Keep the behavior model-gated: other custom endpoints (including
+        # Ollama and llama.cpp) have different continuation contracts.
+        if thinking_prefill and _is_dspark_vllm_model(model):
+            extra_body["add_generation_prompt"] = False
+            extra_body["continue_final_message"] = True
 
         # Reasoning / thinking control for custom OpenAI-compatible endpoints
         # (GLM-5.2 on Volcengine ARK, vLLM, Ollama, llama.cpp, …).
