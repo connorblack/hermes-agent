@@ -145,6 +145,16 @@ class ProviderProfile:
         """
         return {}, {}
 
+    def supports_native_thinking_prefill(self, model: str | None) -> bool:
+        """Whether a marked reasoning-only assistant turn may reach the wire.
+
+        Most providers reject an assistant message containing only reasoning,
+        so the conversation sanitizer drops it. A profile may opt a model into
+        its provider-native unfinished-assistant contract; the transport still
+        removes Hermes's internal marker before serialization.
+        """
+        return False
+
     def default_vision_model(self) -> str | None:
         """Return a default vision model id for this provider, or None.
 

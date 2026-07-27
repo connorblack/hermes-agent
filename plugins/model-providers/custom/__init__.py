@@ -30,6 +30,9 @@ def _is_dspark_vllm_model(model: str | None) -> bool:
 class CustomProfile(ProviderProfile):
     """Custom/Ollama local provider — think=false and num_ctx support."""
 
+    def supports_native_thinking_prefill(self, model: str | None) -> bool:
+        return _is_dspark_vllm_model(model)
+
     def build_api_kwargs_extras(
         self,
         *,

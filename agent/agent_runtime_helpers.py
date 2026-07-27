@@ -1328,7 +1328,8 @@ def drop_thinking_only_and_merge_users(
     # Pass 1: drop thinking-only assistant turns.
     kept = [
         m for m in messages
-        if not _ra().AIAgent._is_thinking_only_assistant(
+        if m.get("_thinking_prefill")
+        or not _ra().AIAgent._is_thinking_only_assistant(
             m,
             drop_codex_reasoning_items=drop_codex_reasoning_items,
         )
