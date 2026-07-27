@@ -81,6 +81,11 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
+try:
+    from aiohttp.client_exceptions import ClientConnectionResetError
+except ImportError:
+    ClientConnectionResetError = ConnectionResetError  # type: ignore[misc,assignment]
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
@@ -127,6 +132,7 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_RESPONSES_SSE_FIELD_JSON_BYTES = 60_000
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
@@ -141,6 +147,29 @@ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
 
 _TRUE_REQUEST_BOOL_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSE_REQUEST_BOOL_STRINGS = frozenset({"0", "false", "no", "off"})
+
+
+def _bound_responses_sse_text(value: Any) -> str:
+    """Bound one JSON-string field below common 128 KiB SSE line limits."""
+    text = value if isinstance(value, str) else str(value)
+    if len(json.dumps(text).encode("utf-8")) <= MAX_RESPONSES_SSE_FIELD_JSON_BYTES:
+        return text
+
+    original_chars = len(text)
+    suffix = (
+        f"\n\n[Tool payload had {original_chars:,} characters and was "
+        "truncated for SSE transport. The full result remains in Hermes tool history.]"
+    )
+    low = 0
+    high = len(text)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        candidate = text[:midpoint] + suffix
+        if len(json.dumps(candidate).encode("utf-8")) <= MAX_RESPONSES_SSE_FIELD_JSON_BYTES:
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return text[:low] + suffix
 
 
 def _coerce_request_bool(value: Any, default: bool = False) -> bool:
@@ -3253,7 +3282,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+        except (
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+            OSError,
+            ClientConnectionResetError,
+        ):
             # Client disconnected mid-stream.  Interrupt the agent so it
             # stops making LLM API calls at the next loop iteration, then
             # cancel the asyncio task wrapper.
@@ -3514,6 +3549,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     arguments_str = json.dumps(args)
                 else:
                     arguments_str = str(args)
+                arguments_str = _bound_responses_sse_text(arguments_str)
                 item = {
                     "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "type": "function_call",
@@ -3578,6 +3614,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 # function_call_output added (result)
                 result_str = result if isinstance(result, str) else json.dumps(result)
+                result_str = _bound_responses_sse_text(result_str)
                 output_parts = [{"type": "input_text", "text": result_str}]
                 output_item = {
                     "id": f"fco_{uuid.uuid4().hex[:24]}",
@@ -3707,6 +3744,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_tool_completed(payload)
                     elif tag == "__reasoning_delta__":
                         await _emit_reasoning_delta(payload)
+                    elif tag == "__stream_write_error__":
+                        raise payload
                 elif isinstance(it, str):
                     # Answer text means the current reasoning burst is over.
                     await _close_reasoning()
@@ -3723,15 +3762,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
             async def _batch_flush_after(delay: float) -> None:
                 """Wait delay seconds, then flush accumulated text deltas."""
+                nonlocal _batch_buf, _batch_timer
                 try:
                     await asyncio.sleep(delay)
+                    # Clear timer reference BEFORE flush so new deltas
+                    # can start a fresh timer while we emit.
+                    _batch_timer = None
+                    await _flush_batch()
                 except asyncio.CancelledError:
                     return
-                # Clear timer reference BEFORE flush so new deltas
-                # can start a fresh timer while we emit
-                nonlocal _batch_buf, _batch_timer
-                _batch_timer = None
-                await _flush_batch()
+                except Exception as exc:
+                    # This timer is detached from the drain loop. Rejoin write
+                    # failures to normal disconnect cleanup instead of leaking
+                    # "Task exception was never retrieved".
+                    _batch_timer = None
+                    stream_q.put(("__stream_write_error__", exc))
 
             async def _flush_batch() -> None:
                 """Emit a single SSE delta for all accumulated text."""
@@ -3959,7 +4004,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "response": completed_env,
                 })
 
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+        except (
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+            OSError,
+            ClientConnectionResetError,
+        ):
             _persist_incomplete_if_needed()
             # Client disconnected — interrupt the agent so it stops
             # making upstream LLM calls, then cancel the task.
@@ -5002,6 +5053,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
                 )
+                agent = None
                 try:
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
@@ -5047,6 +5099,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         result["_compressed"] = True
                     return result, usage
                 finally:
+                    if agent is not None:
+                        memory_manager = getattr(agent, "_memory_manager", None)
+                        if memory_manager is not None:
+                            try:
+                                # This AIAgent is request-scoped even when the
+                                # API conversation continues through stored
+                                # history. Drain and close its clients without
+                                # firing logical on_session_end every turn.
+                                memory_manager.shutdown_all()
+                            except Exception as exc:
+                                logger.warning(
+                                    "API agent memory cleanup failed: %s", exc
+                                )
+                            agent._memory_manager = None
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()
